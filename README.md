@@ -195,6 +195,11 @@ do { ({ cursor } = await notesSearch.clear(ctx, { cursor })); } while (cursor !=
   over very common substrings consume scan budget — raise `budget` if needed.
 - **Scale**: designed for up to ~100k documents per namespace. Storage is
   roughly one small row per character of indexed text.
+- **Traditional vs Simplified Chinese**: NFKC folds width and compatibility
+  forms but does NOT map Simplified↔Traditional — `台` will not match `臺`.
+  If you need that, pre-fold your text (and queries) with a kVariant table
+  (e.g. the IRG kVariants data) before calling `set`/`search`; an opt-in
+  fold option is on the roadmap.
 
 ## Development
 
