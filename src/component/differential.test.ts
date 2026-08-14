@@ -87,8 +87,8 @@ async function drain(
 	throw new Error("search did not terminate");
 }
 
-test("index ≡ naive scan over a hostile corpus, through writes, updates and deletes", async () => {
-	const rand = prng(20260814);
+test.each([20260814, 424242, 7])("index ≡ naive scan over a hostile corpus, through writes, updates and deletes (seed %i)", async (seed) => {
+	const rand = prng(seed);
 	const t = initConvexTest();
 	const docs = new Map<string, { text: string; sortKey: number }>();
 
