@@ -300,31 +300,38 @@ export class SearchIndex<Filter extends string = never> {
 	 * Bind this index to one table with one mapper, and every sync path comes
 	 * for free: `sync(ctx, id)` after any write (works for hard deletes too),
 	 * `syncDoc(ctx, doc)` for backfill migrations, and `trigger()` for
-	 * `convex-helpers/server/triggers`. The mapper receives a query ctx, so
-	 * derived text (joins, counts) is fine; returning `null` keeps the
-	 * document out of the index (archived rows, wrong status…).
+	 * `convex-helpers/server/triggers`. Returning `null` keeps the document
+	 * out of the index (archived rows, wrong status…).
+	 *
+	 * Pass your app's ctx type as `Ctx` when the mapper derives text through
+	 * app reads (`tableIndexer<Doc<"notes">, MutationCtx>({ … })`) — sync
+	 * paths then demand that ctx, and the mapper gets it fully typed.
 	 */
-	tableIndexer<D extends { _id: string }>(options: {
+	tableIndexer<D extends { _id: string }, Ctx extends DbMutationCtx = DbMutationCtx>(options: {
 		table: string;
 		/** Index key for a document id. Default: the id itself. */
 		key?: (id: string) => string;
 		map: (
-			ctx: DbQueryCtx,
+			ctx: Ctx,
 			doc: D,
 		) => Omit<IndexEntry<Filter>, "key"> | null | Promise<Omit<IndexEntry<Filter>, "key"> | null>;
-	}): TableIndexer<D, Filter> {
+	}): TableIndexer<D, Filter, Ctx> {
 		return new TableIndexer(this, options);
 	}
 }
 
-export class TableIndexer<D extends { _id: string }, Filter extends string = never> {
+export class TableIndexer<
+	D extends { _id: string },
+	Filter extends string = never,
+	Ctx extends DbMutationCtx = DbMutationCtx,
+> {
 	constructor(
 		private readonly index: SearchIndex<Filter>,
 		private readonly options: {
 			table: string;
 			key?: (id: string) => string;
 			map: (
-				ctx: DbQueryCtx,
+				ctx: Ctx,
 				doc: D,
 			) =>
 				| Omit<IndexEntry<Filter>, "key">
@@ -342,13 +349,13 @@ export class TableIndexer<D extends { _id: string }, Filter extends string = nev
 	 * after any write in the same mutation. A missing document (hard delete)
 	 * or a `null` mapping removes the entry; anything else upserts it.
 	 */
-	async sync(ctx: DbMutationCtx, id: string): Promise<void> {
+	async sync(ctx: Ctx, id: string): Promise<void> {
 		const doc = await getDoc<D>(ctx, this.options.table, id);
 		await this.syncDoc(ctx, doc, id);
 	}
 
 	/** `sync` for callers already holding the document — e.g. a migration's `migrateOne`. */
-	async syncDoc(ctx: DbMutationCtx, doc: D | null, id?: string): Promise<void> {
+	async syncDoc(ctx: Ctx, doc: D | null, id?: string): Promise<void> {
 		const docId = doc?._id ?? id;
 		if (docId === undefined) {
 			throw new Error("syncDoc needs a document or an explicit id");
@@ -362,7 +369,7 @@ export class TableIndexer<D extends { _id: string }, Filter extends string = nev
 	}
 
 	/** Re-sync a batch of documents (e.g. every receipt of one dispatch after replanning). */
-	async syncMany(ctx: DbMutationCtx, ids: Iterable<string>): Promise<void> {
+	async syncMany(ctx: Ctx, ids: Iterable<string>): Promise<void> {
 		for (const id of ids) await this.sync(ctx, id);
 	}
 
@@ -370,7 +377,7 @@ export class TableIndexer<D extends { _id: string }, Filter extends string = nev
 	 * A trigger for `convex-helpers/server/triggers`, driven by the same
 	 * mapper: `triggers.register("notes", notesIndexer.trigger())`.
 	 */
-	trigger(): (ctx: DbMutationCtx, change: TriggerChange<D>) => Promise<void> {
+	trigger(): (ctx: Ctx, change: TriggerChange<D>) => Promise<void> {
 		return async (ctx, change) => {
 			if (change.operation === "delete") {
 				await this.index.remove(ctx, { key: this.keyOf(change.id) });
