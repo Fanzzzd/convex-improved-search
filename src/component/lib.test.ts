@@ -1,5 +1,5 @@
 /// <reference types="vite/client" />
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { api } from "./_generated/api.js";
 import { initConvexTest } from "./setup.test.js";
 import type { TestConvex } from "convex-test";
@@ -241,12 +241,12 @@ describe("pagination", () => {
 	});
 });
 
-describe("limits", () => {
-	// Distinct CJK codepoints so a 4096-codepoint text produces ~4096 distinct grams.
-	function bigText(length: number): string {
-		return Array.from({ length }, (_, i) => String.fromCodePoint(0x4e00 + (i % 20000))).join("");
-	}
+// Distinct CJK codepoints so a 4096-codepoint text produces ~4096 distinct grams.
+function bigText(length: number): string {
+	return Array.from({ length }, (_, i) => String.fromCodePoint(0x4e00 + (i % 20000))).join("");
+}
 
+describe("limits", () => {
 	test("a 4096-codepoint document indexes, searches, edits, and deletes", async () => {
 		const t = initConvexTest();
 		const text = bigText(4096);
@@ -296,7 +296,108 @@ describe("limits", () => {
 	});
 });
 
+describe("deferred reaping", () => {
+	// Convex counts deletes as reads (4096/transaction), so a max-size doc's
+	// postings cannot die synchronously; correctness must not depend on them.
+	test("removing a max-size document hides it immediately, postings die async", async () => {
+		vi.useFakeTimers();
+		try {
+			const t = initConvexTest();
+			const text = bigText(4096);
+			await t.mutation(api.lib.set, { namespace: NS, key: "big", text, sortKey: 1 });
+			await t.mutation(api.lib.set, { namespace: NS, key: "small", text: "停車場", sortKey: 2 });
+			await t.mutation(api.lib.remove, { namespace: NS, key: "big" });
+			// Unfindable the moment remove() returns, orphaned postings or not.
+			const middle = Array.from(text).slice(2000, 2005).join("");
+			expect(await searchAll(t, middle)).toEqual([]);
+			expect(await searchAll(t, "停車")).toEqual(["small"]);
+			const lingering = await t.run(async (ctx) => {
+				const rows = await ctx.db
+					.query("postings")
+					.withIndex("by_ns_key", (q) => q.eq("namespace", NS).eq("key", "big"))
+					.collect();
+				return rows.length;
+			});
+			expect(lingering).toBeGreaterThan(0);
+			// The reaper chain (self-rescheduling past REAP_BATCH) drains them.
+			await t.finishAllScheduledFunctions(vi.runAllTimers);
+			const after = await t.run(async (ctx) => {
+				const rows = await ctx.db
+					.query("postings")
+					.withIndex("by_ns_key", (q) => q.eq("namespace", NS).eq("key", "big"))
+					.collect();
+				return rows.length;
+			});
+			expect(after).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("shrinking a huge text: old substrings unfindable at once, postings reaped to the new gram set", async () => {
+		vi.useFakeTimers();
+		try {
+			const t = initConvexTest();
+			const text = bigText(4096);
+			await t.mutation(api.lib.set, { namespace: NS, key: "big", text, sortKey: 1 });
+			const middle = Array.from(text).slice(2000, 2005).join("");
+			await t.mutation(api.lib.set, { namespace: NS, key: "big", text: "停車場", sortKey: 1 });
+			expect(await searchAll(t, middle)).toEqual([]);
+			expect(await searchAll(t, "停車場")).toEqual(["big"]);
+			await t.finishAllScheduledFunctions(vi.runAllTimers);
+			const grams = await t.run(async (ctx) => {
+				const rows = await ctx.db
+					.query("postings")
+					.withIndex("by_ns_key", (q) => q.eq("namespace", NS).eq("key", "big"))
+					.collect();
+				return rows.map((r) => r.gram).sort();
+			});
+			// exactly 停車, 車場, 場<sentinel>
+			expect(grams).toEqual(["停車", "場", "車場"].sort());
+			expect(await searchAll(t, "停車場")).toEqual(["big"]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("sortKey change on a multi-thousand-gram text is refused; text edits are not", async () => {
+		const t = initConvexTest();
+		const text = bigText(4096);
+		await t.mutation(api.lib.set, { namespace: NS, key: "big", text, sortKey: 1 });
+		await expect(
+			t.mutation(api.lib.set, { namespace: NS, key: "big", text, sortKey: 2 }),
+		).rejects.toThrow(/sortKey/);
+		// Same sortKey, edited text: fine — this is the supported shape.
+		const edited = `${Array.from(text).slice(0, 4090).join("")}停車場費用又`;
+		await t.mutation(api.lib.set, { namespace: NS, key: "big", text: edited, sortKey: 1 });
+		expect(await searchAll(t, "停車場費用")).toEqual(["big"]);
+	});
+});
+
 describe("clearNamespace", () => {
+	test("a namespace holding a max-size document clears across batches", async () => {
+		const t = initConvexTest();
+		await t.mutation(api.lib.set, { namespace: NS, key: "big", text: bigText(4096), sortKey: 1 });
+		let cursor: string | null = null;
+		let calls = 0;
+		do {
+			const result: { cursor: string | null } = await t.mutation(api.lib.clearNamespace, {
+				namespace: NS,
+				cursor,
+			});
+			cursor = result.cursor;
+			calls += 1;
+		} while (cursor !== null && calls < 100);
+		expect(cursor).toBeNull();
+		expect(calls).toBeGreaterThan(1); // ~4096 postings > one REAP_BATCH
+		const remaining = await t.run(async (ctx) => {
+			const docs = await ctx.db.query("docs").collect();
+			const postings = await ctx.db.query("postings").collect();
+			return docs.length + postings.length;
+		});
+		expect(remaining).toBe(0);
+	});
+
 	test("clears in batches until the cursor is null", async () => {
 		const t = initConvexTest();
 		await seed(

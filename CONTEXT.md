@@ -73,6 +73,22 @@ continues the search exactly where it stopped.
 The terminal search state (`isDone: true`): every Posting stream is
 exhausted. The only signal that no further matches exist.
 
+**Reaper**:
+The component-internal scheduled mutation (`reapKey`) that asynchronously
+deletes an Entry's stale Postings and repairs duplicates and stale Sort
+Keys. Exists because Convex counts deletes as reads (4096/transaction), so
+large unindexing cannot happen inside the caller's transaction. Stale
+Postings are harmless in the meantime: Verification rejects them.
+_Avoid_: garbage collector, compaction
+
+**Shard**:
+(client vocabulary) One Namespace of a `ShardedSearchIndex`, named
+`${name}/${shard}` — typically a time slice like `receipts/2026Q3` whose
+Sort Key range is disjoint from every other Shard's. The component has no
+notion of Shards; sequential per-Shard search yields globally sorted
+results because the ranges are disjoint.
+_Avoid_: partition, bucket
+
 **Oracle**:
 (test vocabulary) The naive full scan — `entries.filter(e =>
 fold(e.text).includes(fold(query)))` — that `search` must equal exactly.

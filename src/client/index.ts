@@ -10,6 +10,10 @@ export { MAX_TEXT_LENGTH, fold } from "../component/grams.js";
 /** Exact-match filter values. `null` is a real value; an absent field matches nothing. */
 export type FilterValue = string | number | boolean | null;
 
+/** Mirror the component's defaults (used for sharded-search bookkeeping only). */
+const DEFAULT_LIMIT = 50;
+const DEFAULT_SCAN_BUDGET = 256;
+
 export type SearchResultPage = {
 	page: { key: string; sortKey: number }[];
 	/**
@@ -214,6 +218,193 @@ export class SearchIndex<Filter extends string = never> {
 				return;
 			}
 			await this.set(ctx, entry);
+		};
+	}
+}
+
+/** An IndexEntry that also names the time shard (or any partition) it lives in. */
+export type ShardedIndexEntry<Filter extends string = never> = IndexEntry<Filter> & {
+	/** Shard name, e.g. "2026Q3". Must be derivable from the document alone. */
+	shard: string;
+};
+
+type ShardCursor = { shard: string; inner: string | null };
+
+/**
+ * Time-sharded search: one SearchIndex per shard, all under one logical name.
+ *
+ * A shard is nothing but a namespace convention (`${name}/${shard}`), so
+ * shards can be created lazily (indexing into a new quarter just works) and
+ * pre-built ahead of a cutover with the normal backfill recipe. Search
+ * drains shards sequentially in the order given, so results are globally
+ * newest-first exactly when the shard list is ordered newest-first and the
+ * shards partition the sortKey range (the natural situation when the shard
+ * is derived from the sortKey, e.g. quarter of `createdAt`).
+ *
+ * ```ts
+ * export const receipts = new ShardedSearchIndex(components.improvedSearch, {
+ *   name: "receipts",
+ *   filterFields: ["source"],
+ * });
+ * const shardOf = (createdAt: number) => {
+ *   const d = new Date(createdAt);
+ *   return `${d.getUTCFullYear()}Q${Math.floor(d.getUTCMonth() / 3) + 1}`;
+ * };
+ *
+ * // Writes: triggers.register("receipts", receipts.trigger((doc) => ({
+ * //   key: doc._id, text: doc.note, sortKey: doc.createdAt,
+ * //   shard: shardOf(doc.createdAt),
+ * // })));
+ *
+ * // Reads: pass the live shard list, newest first.
+ * const result = await receipts.search(ctx, {
+ *   shards: ["2026Q3", "2026Q2", "2026Q1"],
+ *   query: "停車",
+ * });
+ * ```
+ */
+export class ShardedSearchIndex<Filter extends string = never> {
+	private readonly shardIndexes = new Map<string, SearchIndex<Filter>>();
+
+	constructor(
+		private readonly component: ComponentApi,
+		private readonly options: {
+			/** Logical collection name; shard s lives in namespace `${name}/${s}`. */
+			name: string;
+			/** Exact-match filter field names, for typing only. */
+			filterFields?: readonly Filter[];
+		},
+	) {}
+
+	/** The SearchIndex for one shard — full API (set/remove/get/clear/search). */
+	shard(shardName: string): SearchIndex<Filter> {
+		let index = this.shardIndexes.get(shardName);
+		if (index === undefined) {
+			index = new SearchIndex(this.component, {
+				name: `${this.options.name}/${shardName}`,
+				filterFields: this.options.filterFields,
+			});
+			this.shardIndexes.set(shardName, index);
+		}
+		return index;
+	}
+
+	/** Insert or replace one document in its shard. */
+	async set(ctx: RunMutationCtx, entry: ShardedIndexEntry<Filter>): Promise<void> {
+		const { shard, ...rest } = entry;
+		await this.shard(shard).set(ctx, rest);
+	}
+
+	/** Remove one document from the named shard. */
+	async remove(
+		ctx: RunMutationCtx,
+		args: { shard: string; key: string },
+	): Promise<void> {
+		await this.shard(args.shard).remove(ctx, { key: args.key });
+	}
+
+	/**
+	 * Search across shards, in the given order. Same paging contract as
+	 * SearchIndex.search: a short or empty page with a non-null cursor means
+	 * "keep paging". The per-call `budget` applies to each shard visited, so
+	 * one call visits at most a few shards; the cursor carries progress.
+	 */
+	async search(
+		ctx: RunQueryCtx,
+		args: {
+			/** Live shard list, newest first. May grow between calls; a shard named by an in-flight cursor must still be present. */
+			shards: readonly string[];
+			query: string;
+			filters?: Partial<Record<Filter, FilterValue>>;
+			cursor?: string | null;
+			limit?: number;
+			budget?: number;
+		},
+	): Promise<SearchResultPage> {
+		const limit = args.limit ?? DEFAULT_LIMIT;
+		let start = 0;
+		let inner: string | null = null;
+		if (args.cursor != null) {
+			let parsed: ShardCursor;
+			try {
+				parsed = JSON.parse(args.cursor) as ShardCursor;
+				if (typeof parsed.shard !== "string") throw new Error("bad shape");
+			} catch {
+				throw new Error("Invalid sharded search cursor");
+			}
+			start = args.shards.indexOf(parsed.shard);
+			if (start === -1) {
+				throw new Error(
+					`Sharded search cursor points at "${parsed.shard}", which is not in the shard list`,
+				);
+			}
+			inner = parsed.inner;
+		}
+
+		// Each drained shard can cost up to ~budget*4 reads inside the shared
+		// transaction, so bound the shards visited per call accordingly.
+		const budget = args.budget ?? DEFAULT_SCAN_BUDGET;
+		const maxShards = Math.max(1, Math.min(8, Math.floor(3072 / (budget * 4))));
+
+		const page: SearchResultPage["page"] = [];
+		for (let i = start; i < args.shards.length; i += 1) {
+			if (i - start >= maxShards) {
+				return {
+					page,
+					cursor: JSON.stringify({ shard: args.shards[i], inner: null }),
+					isDone: false,
+				};
+			}
+			const result = await this.shard(args.shards[i]).search(ctx, {
+				query: args.query,
+				filters: args.filters,
+				cursor: i === start ? inner : null,
+				limit: limit - page.length,
+				budget: args.budget,
+			});
+			page.push(...result.page);
+			if (!result.isDone) {
+				return {
+					page,
+					cursor: JSON.stringify({ shard: args.shards[i], inner: result.cursor }),
+					isDone: false,
+				};
+			}
+			if (page.length >= limit && i + 1 < args.shards.length) {
+				return {
+					page,
+					cursor: JSON.stringify({ shard: args.shards[i + 1], inner: null }),
+					isDone: false,
+				};
+			}
+		}
+		return { page, cursor: null, isDone: true };
+	}
+
+	/**
+	 * A trigger for `convex-helpers/server/triggers`. The mapper names the
+	 * shard, so the trigger can move a document between shards when the
+	 * mapped shard changes, and knows which shard to delete from. A `null`
+	 * mapping means "not indexed" — with a deterministic mapper there is
+	 * nothing to remove either.
+	 */
+	trigger<D extends { _id: string }>(
+		map: (doc: D) => ShardedIndexEntry<Filter> | null,
+	): (ctx: RunMutationCtx, change: TriggerChange<D>) => Promise<void> {
+		return async (ctx, change) => {
+			const oldEntry = change.oldDoc === null ? null : map(change.oldDoc);
+			const newEntry = change.newDoc === null ? null : map(change.newDoc);
+			if (
+				oldEntry !== null &&
+				(newEntry === null ||
+					newEntry.shard !== oldEntry.shard ||
+					newEntry.key !== oldEntry.key)
+			) {
+				await this.remove(ctx, { shard: oldEntry.shard, key: oldEntry.key });
+			}
+			if (newEntry !== null) {
+				await this.set(ctx, newEntry);
+			}
 		};
 	}
 }

@@ -1,6 +1,7 @@
 import { ConvexError, v } from "convex/values";
-import { mutation, query } from "./_generated/server.js";
+import { internalMutation, mutation, query } from "./_generated/server.js";
 import type { QueryCtx } from "./_generated/server.js";
+import { internal } from "./_generated/api.js";
 import { filtersValidator } from "./schema.js";
 import {
 	MAX_TEXT_LENGTH,
@@ -28,6 +29,22 @@ const MAX_LIMIT = 200;
 const PROBE_GRAMS = 8;
 const PROBE_ROWS = 17;
 const CHECK_GRAMS = 3;
+
+/**
+ * Convex counts every delete/patch as a read toward its 4096-reads-per-
+ * transaction limit, so a max-size document (~4096 postings) cannot be
+ * unindexed synchronously — and `set`/`remove` share their transaction with
+ * the caller. Stale postings are harmless (Verification rejects their
+ * documents), so posting deletes beyond a small inline budget are deferred
+ * to `reapKey`, a self-rescheduling internal mutation that owns a whole
+ * transaction. SortKey rewrites cannot be deferred — a stale sortKey moves a
+ * valid posting in the candidate stream and breaks page order — so they run
+ * inline and are refused past SYNC_PATCH_LIMIT (in practice: avoid mutable
+ * sort keys on multi-thousand-gram texts).
+ */
+const SYNC_DELETE_BUDGET = 800;
+const SYNC_PATCH_LIMIT = 3000;
+const REAP_BATCH = 3000;
 
 const searchResultValidator = v.object({
 	page: v.array(v.object({ key: v.string(), sortKey: v.number() })),
@@ -137,22 +154,25 @@ export const search = query({
 
 		const page: { key: string; sortKey: number }[] = [];
 		let scanned = 0;
+		let streamed = 0;
 		let last: Cursor | null = null;
 		let exhausted = true;
-		let previous: Cursor | null = null;
+		const seen = new Set<string>();
 		for await (const posting of stream) {
 			if (coveredByCursor(cursor, posting.sortKey, posting.key)) continue;
-			// The g1 index holds one row per (doc, gram-starting-with-g1);
-			// duplicates for a doc share (sortKey, key) and are adjacent.
-			if (
-				previous !== null &&
-				previous.s === posting.sortKey &&
-				previous.k === posting.key
-			) {
-				continue;
+			// Skipped duplicates cost a streamed row but no reads, so they get
+			// their own (generous) cap instead of the scan budget. Checked
+			// before `last` moves: the cursor must never cover an unhandled row.
+			streamed += 1;
+			if (streamed > budget * 8) {
+				exhausted = false;
+				break;
 			}
-			previous = { s: posting.sortKey, k: posting.key };
-			last = previous;
+			last = { s: posting.sortKey, k: posting.key };
+			// One document can own many posting rows in this stream (all its
+			// g1 grams; briefly, duplicate rows while a reap is pending).
+			if (seen.has(posting.key)) continue;
+			seen.add(posting.key);
 			scanned += 1;
 
 			const matches = await candidateMatches(
@@ -193,14 +213,15 @@ async function candidateMatches(
 	wantedFilters: [string, string | number | boolean | null][],
 	foldedQuery: string,
 ): Promise<number | null> {
-	// Cheap rejections first: gram membership point-reads…
+	// Cheap rejections first: gram membership point-reads. `.first()`, not
+	// `.unique()`: a pending reap may leave short-lived duplicate rows.
 	for (const gram of checkGrams) {
 		const hit = await ctx.db
 			.query("postings")
 			.withIndex("by_ns_key", (q) =>
 				q.eq("namespace", namespace).eq("key", key).eq("gram", gram),
 			)
-			.unique();
+			.first();
 		if (hit === null) return null;
 	}
 	// …then the doc read, filters, and the exact verification that makes the
@@ -270,12 +291,38 @@ export const set = mutation({
 			)
 			.collect();
 		const oldByGram = new Map(oldPostings.map((p) => [p.gram, p]));
+		const toPatch: typeof oldPostings = [];
+		const toDelete: typeof oldPostings = [];
 		for (const [gram, postingRow] of oldByGram) {
 			if (!newGrams.has(gram)) {
-				await ctx.db.delete("postings", postingRow._id);
+				toDelete.push(postingRow);
 			} else if (postingRow.sortKey !== args.sortKey) {
-				await ctx.db.patch("postings", postingRow._id, { sortKey: args.sortKey });
+				toPatch.push(postingRow);
 			}
+		}
+		if (toPatch.length > SYNC_PATCH_LIMIT) {
+			throw new ConvexError(
+				`Changing the sortKey of "${args.key}" would rewrite ${toPatch.length} ` +
+					`postings in one transaction (limit ${SYNC_PATCH_LIMIT}). Use a ` +
+					`stable sortKey for very large texts, or remove() and re-set() ` +
+					`after its reap completes.`,
+			);
+		}
+		for (const postingRow of toPatch) {
+			await ctx.db.patch("postings", postingRow._id, { sortKey: args.sortKey });
+		}
+		// Deletes are deferrable (stale postings are only false candidates), so
+		// spend a small inline budget and hand the rest to the reaper. A dup
+		// row (same gram twice, from an earlier deferred remove) also needs it.
+		let deleteBudget = Math.min(SYNC_DELETE_BUDGET, SYNC_PATCH_LIMIT - toPatch.length);
+		let deferred = oldPostings.length !== oldByGram.size;
+		for (const postingRow of toDelete) {
+			if (deleteBudget <= 0) {
+				deferred = true;
+				break;
+			}
+			await ctx.db.delete("postings", postingRow._id);
+			deleteBudget -= 1;
 		}
 		for (const gram of newGrams) {
 			if (!oldByGram.has(gram)) {
@@ -288,6 +335,12 @@ export const set = mutation({
 				});
 			}
 		}
+		if (deferred) {
+			await ctx.scheduler.runAfter(0, internal.lib.reapKey, {
+				namespace: args.namespace,
+				key: args.key,
+			});
+		}
 		return null;
 	},
 });
@@ -296,6 +349,9 @@ export const remove = mutation({
 	args: { namespace: v.string(), key: v.string() },
 	returns: v.null(),
 	handler: async (ctx, args) => {
+		// The docs row is the source of truth: once it is gone the Entry can
+		// never match again (Verification reads the doc). Leftover postings
+		// are cost, not correctness, so only a bounded number die inline.
 		const doc = await ctx.db
 			.query("docs")
 			.withIndex("by_ns_key", (q) =>
@@ -309,7 +365,67 @@ export const remove = mutation({
 				q.eq("namespace", args.namespace).eq("key", args.key),
 			)
 			.collect();
-		for (const posting of postings) await ctx.db.delete("postings", posting._id);
+		let deleteBudget = SYNC_DELETE_BUDGET;
+		let deferred = false;
+		for (const posting of postings) {
+			if (deleteBudget <= 0) {
+				deferred = true;
+				break;
+			}
+			await ctx.db.delete("postings", posting._id);
+			deleteBudget -= 1;
+		}
+		if (deferred) {
+			await ctx.scheduler.runAfter(0, internal.lib.reapKey, {
+				namespace: args.namespace,
+				key: args.key,
+			});
+		}
+		return null;
+	},
+});
+
+/**
+ * Bring one Entry's postings back in line with its docs row: drop postings
+ * for grams the (possibly deleted) document no longer contains, drop
+ * duplicate rows, and repair stale sortKeys. Owns its whole transaction, so
+ * it can afford REAP_BATCH row-ops per run; anything beyond reschedules
+ * itself. Idempotent — double-scheduling just wastes one run.
+ */
+export const reapKey = internalMutation({
+	args: { namespace: v.string(), key: v.string() },
+	returns: v.null(),
+	handler: async (ctx, args) => {
+		const doc = await ctx.db
+			.query("docs")
+			.withIndex("by_ns_key", (q) =>
+				q.eq("namespace", args.namespace).eq("key", args.key),
+			)
+			.unique();
+		const validGrams = doc === null ? null : documentGrams(doc.foldedText);
+		let ops = 0;
+		let previousGram: string | null = null;
+		// by_ns_key orders a key's postings by gram, so duplicates are adjacent.
+		const postings = ctx.db
+			.query("postings")
+			.withIndex("by_ns_key", (q) =>
+				q.eq("namespace", args.namespace).eq("key", args.key),
+			);
+		for await (const posting of postings) {
+			if (ops >= REAP_BATCH) {
+				await ctx.scheduler.runAfter(0, internal.lib.reapKey, args);
+				return null;
+			}
+			const duplicate = posting.gram === previousGram;
+			previousGram = posting.gram;
+			if (validGrams === null || !validGrams.has(posting.gram) || duplicate) {
+				await ctx.db.delete("postings", posting._id);
+				ops += 1;
+			} else if (doc !== null && posting.sortKey !== doc.sortKey) {
+				await ctx.db.patch("postings", posting._id, { sortKey: doc.sortKey });
+				ops += 1;
+			}
+		}
 		return null;
 	},
 });
@@ -338,8 +454,11 @@ export const get = query({
 });
 
 /**
- * Delete one batch of a namespace, bounded by the per-transaction write
- * budget (a single max-size doc is ~4k postings). Loop until cursor is null:
+ * Delete one batch of a namespace. Docs die first (so nothing in the
+ * namespace can match anymore after the first pass over docs), then
+ * postings. The deletes themselves are the progress — each call restarts
+ * from the front of what remains, so the returned cursor is only a "not
+ * done yet" marker. Loop until cursor is null:
  *
  *   let cursor: string | null = null;
  *   do { ({ cursor } = await clearNamespace(...)); } while (cursor !== null);
@@ -351,30 +470,24 @@ export const clearNamespace = mutation({
 	},
 	returns: v.object({ cursor: v.union(v.string(), v.null()) }),
 	handler: async (ctx, args) => {
-		const WRITE_BUDGET = 3200;
-		let writes = 0;
-		let lastKey: string | null = null;
+		// Deletes count as reads (4096/transaction); this call owns its
+		// transaction, so REAP_BATCH is the right ceiling here too.
+		let ops = 0;
 		const docs = ctx.db
 			.query("docs")
-			.withIndex("by_ns_key", (q) => {
-				const base = q.eq("namespace", args.namespace);
-				return args.cursor != null ? base.gt("key", args.cursor) : base;
-			})
-			.order("asc");
+			.withIndex("by_ns_key", (q) => q.eq("namespace", args.namespace));
 		for await (const doc of docs) {
-			const postings = await ctx.db
-				.query("postings")
-				.withIndex("by_ns_key", (q) =>
-					q.eq("namespace", args.namespace).eq("key", doc.key),
-				)
-				.collect();
-			for (const posting of postings) await ctx.db.delete("postings", posting._id);
 			await ctx.db.delete("docs", doc._id);
-			writes += postings.length + 1;
-			lastKey = doc.key;
-			if (writes >= WRITE_BUDGET) {
-				return { cursor: lastKey };
-			}
+			ops += 1;
+			if (ops >= REAP_BATCH) return { cursor: "continue" };
+		}
+		const postings = ctx.db
+			.query("postings")
+			.withIndex("by_ns_key", (q) => q.eq("namespace", args.namespace));
+		for await (const posting of postings) {
+			await ctx.db.delete("postings", posting._id);
+			ops += 1;
+			if (ops >= REAP_BATCH) return { cursor: "continue" };
 		}
 		return { cursor: null };
 	},

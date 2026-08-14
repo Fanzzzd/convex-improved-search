@@ -166,6 +166,42 @@ let cursor: string | null = null;
 do { ({ cursor } = await notesSearch.clear(ctx, { cursor })); } while (cursor !== null);
 ```
 
+### Scaling out: time shards
+
+Past ~100k entries per namespace, partition by time with
+`ShardedSearchIndex` — one namespace per shard (`receipts/2026Q3`), created
+lazily on first write, pre-indexable ahead of a cutover with the ordinary
+backfill recipe, droppable per shard via `clear`:
+
+```ts
+export const receipts = new ShardedSearchIndex(components.improvedSearch, {
+  name: "receipts",
+  filterFields: ["source"],
+});
+const shardOf = (createdAt: number) => {
+  const d = new Date(createdAt);
+  return `${d.getUTCFullYear()}Q${Math.floor(d.getUTCMonth() / 3) + 1}`;
+};
+
+// Writes (or receipts.trigger(...) with the same mapper):
+await receipts.set(ctx, {
+  key: doc._id, text: doc.note, sortKey: doc.createdAt,
+  shard: shardOf(doc.createdAt),
+});
+
+// Reads: pass the live shard list, newest first.
+const page = await receipts.search(ctx, {
+  shards: ["2026Q3", "2026Q2", "2026Q1"],
+  query: "停車",
+});
+```
+
+The contract: derive the shard from the `sortKey`, so shard ranges are
+disjoint and newest-first shard order makes concatenated results globally
+sorted. Recent-first UIs get their answers from the first shard at a
+fraction of the cost; paging naturally continues into older shards
+(same cursor contract as `SearchIndex.search`).
+
 ## How it works
 
 - Text is folded (`NFKC` + `toLowerCase`) and split into overlapping
@@ -189,12 +225,20 @@ do { ({ cursor } = await notesSearch.clear(ctx, { cursor })); } while (cursor !=
   pass `onOverflow: "error"` to throw instead. The write path is engineered
   so a full-size document indexes within one Convex transaction — but avoid
   writing *several* max-size documents in a single mutation.
+- **Deletes are lazy**: `remove` (and large shrinking edits) make the entry
+  unfindable immediately, but posting cleanup beyond a small inline budget
+  runs in a component-internal scheduled mutation moments later. Until it
+  runs, leftover postings are only rejected candidates — never wrong
+  results. (Convex counts deletes as reads, 4096/transaction, so a max-size
+  document cannot be unindexed synchronously.)
 - **Ordering**: `sortKey` descending only. Changing a doc's `sortKey`
-  rewrites all its posting rows; prefer stable sort keys (creation time).
+  rewrites all its posting rows synchronously; a change touching more than
+  3000 surviving grams is refused. Prefer stable sort keys (creation time).
 - **Filters**: exact-match only, post-filtering. Highly selective filters
   over very common substrings consume scan budget — raise `budget` if needed.
 - **Scale**: designed for up to ~100k documents per namespace. Storage is
-  roughly one small row per character of indexed text.
+  roughly one small row per character of indexed text. Beyond that,
+  partition by time with `ShardedSearchIndex` (see above).
 - **Traditional vs Simplified Chinese**: NFKC folds width and compatibility
   forms but does NOT map Simplified↔Traditional — `台` will not match `臺`.
   If you need that, pre-fold your text (and queries) with a kVariant table
@@ -205,7 +249,7 @@ do { ({ cursor } = await notesSearch.clear(ctx, { cursor })); } while (cursor !=
 
 ```bash
 npm install
-npm run test        # 51 tests incl. randomized differential suite
+npm run test        # 67 tests incl. randomized differential suite
 npm run typecheck
 npm run lint
 ```
