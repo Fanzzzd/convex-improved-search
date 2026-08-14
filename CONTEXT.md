@@ -6,9 +6,15 @@ context: the component, its client SDK, and the vocabulary they share.
 ## Language
 
 **Entry**:
-One indexed unit: a key, its searchable text, a sort key, and optional
-filters. What you pass to `set`.
+One indexed unit: a key, one or more named text Fields, a sort key, and
+optional filters. What you pass to `set`.
 _Avoid_: record, row, document (a Convex "document" is a storage concept)
+
+**Field**:
+One named text of an Entry (`note`, `cargo`, …). Folded and indexed
+independently: a match never spans a Field boundary, and hits report which
+Fields matched. A single-string Entry is one Field named `text`.
+_Avoid_: column, attribute
 
 **Key**:
 The caller-chosen identifier of an Entry — typically the app document's
@@ -21,7 +27,7 @@ One logical collection of Entries, isolated from all others. One
 _Avoid_: index (overloaded), table, collection
 
 **Folded Text**:
-An Entry's text after Folding — the only form that is ever indexed or
+A Field's text after Folding — the only form that is ever indexed or
 compared.
 
 **Folding**:
@@ -42,9 +48,11 @@ One stored (Namespace, Gram, Key, Sort Key) fact: "this Entry contains
 this Gram".
 
 **Verification**:
-The final `foldedText.includes(foldedQuery)` check on every candidate.
-Postings only nominate candidates; Verification decides. Correctness never
-rests on Grams.
+The final per-Field `folded.includes(foldedQuery)` check on every
+candidate. Postings only nominate candidates; Verification decides.
+Correctness never rests on Grams. Its free by-product is **Matched
+Fields**: the names of the Fields that contained the query, reported on
+every hit.
 _Avoid_: recheck, filter (collides with Filters)
 
 **Sort Key**:
@@ -89,6 +97,14 @@ notion of Shards; sequential per-Shard search yields globally sorted
 results because the ranges are disjoint.
 _Avoid_: partition, bucket
 
+**Indexer**:
+(client vocabulary) A `TableIndexer`: one table, one mapper from document
+to Entry (or `null` for "keep out"), from which every sync path derives —
+`sync` after a write, `syncDoc` in a backfill, `trigger` for
+convex-helpers triggers.
+_Avoid_: syncer, binding
+
 **Oracle**:
-(test vocabulary) The naive full scan — `entries.filter(e =>
-fold(e.text).includes(fold(query)))` — that `search` must equal exactly.
+(test vocabulary) The naive full scan — an Entry matches when any Field's
+Folded Text contains the folded query — that `search` must equal exactly,
+Matched Fields included.

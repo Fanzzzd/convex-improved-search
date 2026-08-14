@@ -2,10 +2,10 @@ import { ConvexError, v } from "convex/values";
 import { internalMutation, mutation, query } from "./_generated/server.js";
 import type { QueryCtx } from "./_generated/server.js";
 import { internal } from "./_generated/api.js";
-import { filtersValidator } from "./schema.js";
+import { filtersValidator, foldedFieldsValidator } from "./schema.js";
 import {
 	MAX_TEXT_LENGTH,
-	documentGrams,
+	documentGramsOfFields,
 	firstCodepoint,
 	fold,
 	queryGrams,
@@ -47,7 +47,14 @@ const SYNC_PATCH_LIMIT = 3000;
 const REAP_BATCH = 3000;
 
 const searchResultValidator = v.object({
-	page: v.array(v.object({ key: v.string(), sortKey: v.number() })),
+	page: v.array(
+		v.object({
+			key: v.string(),
+			sortKey: v.number(),
+			/** Field names whose text contains the query — free with Verification. */
+			matchedFields: v.array(v.string()),
+		}),
+	),
 	/** Pass back to continue. Non-null with an unfilled page means "budget spent, keep paging". */
 	cursor: v.union(v.string(), v.null()),
 	isDone: v.boolean(),
@@ -152,7 +159,7 @@ export const search = query({
 						})
 						.order("desc");
 
-		const page: { key: string; sortKey: number }[] = [];
+		const page: { key: string; sortKey: number; matchedFields: string[] }[] = [];
 		let scanned = 0;
 		let streamed = 0;
 		let last: Cursor | null = null;
@@ -184,7 +191,7 @@ export const search = query({
 				folded,
 			);
 			if (matches !== null) {
-				page.push({ key: posting.key, sortKey: matches });
+				page.push({ key: posting.key, ...matches });
 				if (page.length >= limit) {
 					exhausted = false;
 					break;
@@ -204,7 +211,7 @@ export const search = query({
 	},
 });
 
-/** Returns the doc's sortKey when the candidate truly matches, else null. */
+/** Returns the doc's sortKey + matched field names when the candidate truly matches, else null. */
 async function candidateMatches(
 	ctx: { db: QueryCtx["db"] },
 	namespace: string,
@@ -212,7 +219,7 @@ async function candidateMatches(
 	checkGrams: string[],
 	wantedFilters: [string, string | number | boolean | null][],
 	foldedQuery: string,
-): Promise<number | null> {
+): Promise<{ sortKey: number; matchedFields: string[] } | null> {
 	// Cheap rejections first: gram membership point-reads. `.first()`, not
 	// `.unique()`: a pending reap may leave short-lived duplicate rows.
 	for (const gram of checkGrams) {
@@ -224,8 +231,9 @@ async function candidateMatches(
 			.first();
 		if (hit === null) return null;
 	}
-	// …then the doc read, filters, and the exact verification that makes the
-	// index a pure candidate filter: correctness never rests on the grams.
+	// …then the doc read, filters, and the exact per-field verification that
+	// makes the index a pure candidate filter: correctness never rests on the
+	// grams, and matched field names fall out for free.
 	const doc = await ctx.db
 		.query("docs")
 		.withIndex("by_ns_key", (q) => q.eq("namespace", namespace).eq("key", key))
@@ -234,30 +242,52 @@ async function candidateMatches(
 	for (const [field, value] of wantedFilters) {
 		if (doc.filters?.[field] !== value) return null;
 	}
-	if (!doc.foldedText.includes(foldedQuery)) return null;
-	return doc.sortKey;
+	const matchedFields = Object.entries(doc.fields)
+		.filter(([, folded]) => folded.includes(foldedQuery))
+		.map(([name]) => name);
+	if (matchedFields.length === 0) return null;
+	return { sortKey: doc.sortKey, matchedFields };
 }
 
 export const set = mutation({
 	args: {
 		namespace: v.string(),
 		key: v.string(),
-		text: v.string(),
+		/**
+		 * Ordered searchable fields (an array because Convex records do not
+		 * preserve key order, and the overflow budget consumes fields in the
+		 * order given). Single-text callers send one field named "text".
+		 */
+		fields: v.array(v.object({ name: v.string(), value: v.string() })),
 		sortKey: v.number(),
 		filters: v.optional(filtersValidator),
-		/** What to do when the folded text exceeds MAX_TEXT_LENGTH codepoints. Default: truncate. */
+		/** What to do when the folded fields exceed MAX_TEXT_LENGTH codepoints in total. Default: truncate. */
 		onOverflow: v.optional(v.union(v.literal("truncate"), v.literal("error"))),
 	},
 	returns: v.null(),
 	handler: async (ctx, args) => {
-		let folded = fold(args.text);
-		if (Array.from(folded).length > MAX_TEXT_LENGTH) {
-			if (args.onOverflow === "error") {
-				throw new ConvexError(
-					`Text exceeds ${MAX_TEXT_LENGTH} codepoints after folding`,
-				);
+		// Fold each field and spend one shared codepoint budget across them in
+		// the order given: the overflowing field is cut, later fields dropped.
+		const foldedFields: Record<string, string> = {};
+		let budget = MAX_TEXT_LENGTH;
+		for (const field of args.fields) {
+			if (field.name in foldedFields) {
+				throw new ConvexError(`Duplicate field name "${field.name}"`);
 			}
-			folded = truncateCodepoints(folded, MAX_TEXT_LENGTH);
+			const folded = fold(field.value);
+			const length = Array.from(folded).length;
+			if (length > budget) {
+				if (args.onOverflow === "error") {
+					throw new ConvexError(
+						`Fields exceed ${MAX_TEXT_LENGTH} codepoints after folding`,
+					);
+				}
+				if (budget > 0) foldedFields[field.name] = truncateCodepoints(folded, budget);
+				budget = 0;
+				continue;
+			}
+			foldedFields[field.name] = folded;
+			budget -= length;
 		}
 
 		const existing = await ctx.db
@@ -271,7 +301,7 @@ export const set = mutation({
 		const docRow = {
 			namespace: args.namespace,
 			key: args.key,
-			foldedText: folded,
+			fields: foldedFields,
 			sortKey: args.sortKey,
 			...(args.filters === undefined ? {} : { filters: args.filters }),
 		};
@@ -283,7 +313,8 @@ export const set = mutation({
 
 		// Gram diff: text edits touch few grams, so re-setting a document is
 		// nearly free; only a full text replacement pays the full fan-out.
-		const newGrams = documentGrams(folded);
+		// Grams never span fields: each field gets its own window + sentinel.
+		const newGrams = documentGramsOfFields(foldedFields);
 		const oldPostings = await ctx.db
 			.query("postings")
 			.withIndex("by_ns_key", (q) =>
@@ -402,7 +433,7 @@ export const reapKey = internalMutation({
 				q.eq("namespace", args.namespace).eq("key", args.key),
 			)
 			.unique();
-		const validGrams = doc === null ? null : documentGrams(doc.foldedText);
+		const validGrams = doc === null ? null : documentGramsOfFields(doc.fields);
 		let ops = 0;
 		let previousGram: string | null = null;
 		// by_ns_key orders a key's postings by gram, so duplicates are adjacent.
@@ -436,7 +467,7 @@ export const get = query({
 	returns: v.union(
 		v.null(),
 		v.object({
-			foldedText: v.string(),
+			fields: foldedFieldsValidator,
 			sortKey: v.number(),
 			filters: v.optional(filtersValidator),
 		}),
@@ -449,7 +480,7 @@ export const get = query({
 			)
 			.unique();
 		if (doc === null) return null;
-		return { foldedText: doc.foldedText, sortKey: doc.sortKey, filters: doc.filters };
+		return { fields: doc.fields, sortKey: doc.sortKey, filters: doc.filters };
 	},
 });
 

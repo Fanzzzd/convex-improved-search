@@ -1,21 +1,26 @@
-import type {
-	GenericDataModel,
-	GenericMutationCtx,
-	GenericQueryCtx,
-} from "convex/server";
+import type { GenericDataModel, GenericMutationCtx, GenericQueryCtx } from "convex/server";
 import type { ComponentApi } from "../component/_generated/component.js";
+
+import { fold } from "../component/grams.js";
 
 export { MAX_TEXT_LENGTH, fold } from "../component/grams.js";
 
 /** Exact-match filter values. `null` is a real value; an absent field matches nothing. */
 export type FilterValue = string | number | boolean | null;
 
-/** Mirror the component's defaults (used for sharded-search bookkeeping only). */
+/** Mirror the component's defaults (used for client-side bookkeeping only). */
 const DEFAULT_LIMIT = 50;
 const DEFAULT_SCAN_BUDGET = 256;
 
+export type SearchHit = {
+	key: string;
+	sortKey: number;
+	/** Names of the entry's fields whose text contains the query (single-text entries: ["text"]). */
+	matchedFields: string[];
+};
+
 export type SearchResultPage = {
-	page: { key: string; sortKey: number }[];
+	page: SearchHit[];
 	/**
 	 * Pass back to keep paging. IMPORTANT: a non-null cursor with a short (or
 	 * even empty) page means the scan budget ran out before the page filled —
@@ -26,20 +31,57 @@ export type SearchResultPage = {
 	isDone: boolean;
 };
 
+/**
+ * Searchable text: one string (indexed under the field name "text"), or
+ * named fields. A query never matches across a field boundary, and results
+ * report which fields hit via `matchedFields`. Field names follow Convex
+ * record-key rules (nonempty ASCII, no leading $/_).
+ */
+export type SearchText = string | Record<string, string>;
+
 export type IndexEntry<Filter extends string = never> = {
 	/** Identifier of the indexed document — typically your doc's `_id`. */
 	key: string;
-	/** The searchable text. Folded (NFKC + lowercase) and bigram-indexed. */
-	text: string;
+	/** The searchable text. Folded (NFKC + lowercase) and bigram-indexed per field. */
+	text: SearchText;
 	/** Results are ordered by sortKey descending — typically a creation timestamp. */
 	sortKey: number;
 	filters?: Partial<Record<Filter, FilterValue>>;
-	/** Behavior when the folded text exceeds MAX_TEXT_LENGTH codepoints. Default "truncate". */
+	/** Behavior when the folded fields exceed MAX_TEXT_LENGTH codepoints in total. Default "truncate". */
 	onOverflow?: "truncate" | "error";
 };
 
+export type SearchArgs<Filter extends string = never> = {
+	query: string;
+	filters?: Partial<Record<Filter, FilterValue>>;
+	cursor?: string | null;
+	limit?: number;
+	/** Max candidate postings scanned this call. Raise for very selective filters. */
+	budget?: number;
+};
+
+/** The `paginationOpts` shape Convex clients (e.g. usePaginatedQuery) send. */
+export type PaginationOptsLike = { numItems: number; cursor: string | null };
+
 type RunQueryCtx = Pick<GenericQueryCtx<GenericDataModel>, "runQuery">;
 type RunMutationCtx = Pick<GenericMutationCtx<GenericDataModel>, "runMutation">;
+/**
+ * Structural — a concrete app ctx is not assignable to
+ * `GenericQueryCtx<GenericDataModel>`, so we ask only for what we use.
+ * Method syntax on purpose: bivariant params accept any data model.
+ */
+type MinimalDb = { get(table: string, id: string): Promise<unknown> };
+/** A query ctx that can also read the app's tables (for hydration / mapping). */
+export type DbQueryCtx = RunQueryCtx & { db: MinimalDb };
+/** A mutation ctx that can also read the app's tables (for syncing). */
+export type DbMutationCtx = RunQueryCtx & RunMutationCtx & { db: MinimalDb };
+
+/** Wire shape: an ordered field list (Convex records do not preserve key order). */
+function wireFields(text: SearchText): { name: string; value: string }[] {
+	return typeof text === "string"
+		? [{ name: "text", value: text }]
+		: Object.entries(text).map(([name, value]) => ({ name, value }));
+}
 
 /** Drop `undefined` entries (allowed by Partial<>) — the wire format has real values only. */
 function compactFilters(
@@ -50,6 +92,10 @@ function compactFilters(
 		(entry): entry is [string, FilterValue] => entry[1] !== undefined,
 	);
 	return Object.fromEntries(entries);
+}
+
+async function getDoc<D>(ctx: DbQueryCtx, table: string, key: string): Promise<D | null> {
+	return (await ctx.db.get(table, key)) as D | null;
 }
 
 /** The change shape produced by `convex-helpers/server/triggers` (structural — no hard dependency). */
@@ -68,24 +114,28 @@ type TriggerChange<D> = {
  * import { SearchIndex } from "convex-improved-search";
  * import { components } from "./_generated/api";
  *
- * export const receipts = new SearchIndex(components.improvedSearch, {
- *   name: "receipts",
- *   filterFields: ["source", "category"],
+ * export const notesSearch = new SearchIndex(components.improvedSearch, {
+ *   name: "notes",
+ *   filterFields: ["category"],
+ * });
+ * export const notesIndexer = notesSearch.tableIndexer<Doc<"notes">>({
+ *   table: "notes",
+ *   map: (ctx, note) =>
+ *     note.archived ? null : {
+ *       text: { title: note.title, body: note.body },
+ *       sortKey: note.createdAt,
+ *       filters: { category: note.category },
+ *     },
  * });
  *
- * // In your mutations (same transaction as your own writes):
- * await receipts.set(ctx, {
- *   key: doc._id,
- *   text: buildSearchText(doc),
- *   sortKey: doc.createdAt,
- *   filters: { source: "freight", category: doc.type },
- * });
+ * // After any write (insert/edit/archive/delete) — one line, same transaction:
+ * await notesIndexer.sync(ctx, noteId);
  *
  * // In your queries (reactive like any Convex query):
- * const { page, cursor, isDone } = await receipts.search(ctx, {
- *   query: "停車",
- *   filters: { category: "parking" },
- * });
+ * const { page, isDone, continueCursor } = await notesSearch.searchDocsPaginated<Doc<"notes">>(
+ *   ctx,
+ *   { table: "notes", query: "停車", paginationOpts },
+ * );
  * ```
  */
 export class SearchIndex<Filter extends string = never> {
@@ -107,7 +157,7 @@ export class SearchIndex<Filter extends string = never> {
 		await ctx.runMutation(this.component.lib.set, {
 			namespace: this.options.name,
 			key: entry.key,
-			text: entry.text,
+			fields: wireFields(entry.text),
 			sortKey: entry.sortKey,
 			filters: compactFilters(entry.filters),
 			onOverflow: entry.onOverflow,
@@ -124,20 +174,10 @@ export class SearchIndex<Filter extends string = never> {
 
 	/**
 	 * Exact substring search over the index, newest first.
-	 * The result set is exactly `docs.filter((d) => fold(d.text).includes(fold(query)))`
+	 * The result set is exactly `docs.filter((d) => someField(d, (f) => fold(f).includes(fold(query))))`
 	 * — the inverted index only accelerates, never approximates.
 	 */
-	async search(
-		ctx: RunQueryCtx,
-		args: {
-			query: string;
-			filters?: Partial<Record<Filter, FilterValue>>;
-			cursor?: string | null;
-			limit?: number;
-			/** Max candidate postings scanned this call. Raise for very selective filters. */
-			budget?: number;
-		},
-	): Promise<SearchResultPage> {
+	async search(ctx: RunQueryCtx, args: SearchArgs<Filter>): Promise<SearchResultPage> {
 		return await ctx.runQuery(this.component.lib.search, {
 			namespace: this.options.name,
 			query: args.query,
@@ -148,12 +188,86 @@ export class SearchIndex<Filter extends string = never> {
 		});
 	}
 
+	/**
+	 * Search + hydrate in one call, for the common case where `key` is a
+	 * document `_id` of one table. Keys whose document is gone are dropped
+	 * (the page may come up short; the cursor contract is unchanged).
+	 */
+	async searchDocs<D>(
+		ctx: DbQueryCtx,
+		args: SearchArgs<Filter> & { table: string },
+	): Promise<{
+		page: { doc: D; sortKey: number; matchedFields: string[] }[];
+		cursor: string | null;
+		isDone: boolean;
+	}> {
+		const result = await this.search(ctx, args);
+		const page: { doc: D; sortKey: number; matchedFields: string[] }[] = [];
+		for (const hit of result.page) {
+			const doc = await getDoc<D>(ctx, args.table, hit.key);
+			if (doc !== null) {
+				page.push({ doc, sortKey: hit.sortKey, matchedFields: hit.matchedFields });
+			}
+		}
+		return { page, cursor: result.cursor, isDone: result.isDone };
+	}
+
+	/**
+	 * `search` in Convex's standard paginated shape, so an app query can take
+	 * `paginationOpts: paginationOptsValidator` and plug into paginated-query
+	 * clients. (Pages are cursor-stable but, unlike `.paginate()`, not
+	 * gapless under live updates.)
+	 */
+	async searchPaginated(
+		ctx: RunQueryCtx,
+		args: Omit<SearchArgs<Filter>, "cursor" | "limit"> & {
+			paginationOpts: PaginationOptsLike;
+		},
+	): Promise<{ page: SearchHit[]; isDone: boolean; continueCursor: string }> {
+		const { paginationOpts, ...rest } = args;
+		const result = await this.search(ctx, {
+			...rest,
+			cursor: paginationOpts.cursor,
+			limit: paginationOpts.numItems,
+		});
+		return {
+			page: result.page,
+			isDone: result.isDone,
+			continueCursor: result.cursor ?? "",
+		};
+	}
+
+	/** `searchDocs` in Convex's standard paginated shape. */
+	async searchDocsPaginated<D>(
+		ctx: DbQueryCtx,
+		args: Omit<SearchArgs<Filter>, "cursor" | "limit"> & {
+			table: string;
+			paginationOpts: PaginationOptsLike;
+		},
+	): Promise<{
+		page: { doc: D; sortKey: number; matchedFields: string[] }[];
+		isDone: boolean;
+		continueCursor: string;
+	}> {
+		const { paginationOpts, ...rest } = args;
+		const result = await this.searchDocs<D>(ctx, {
+			...rest,
+			cursor: paginationOpts.cursor,
+			limit: paginationOpts.numItems,
+		});
+		return {
+			page: result.page,
+			isDone: result.isDone,
+			continueCursor: result.cursor ?? "",
+		};
+	}
+
 	/** What the index believes about one key (drift inspection for reconcile recipes). */
 	async get(
 		ctx: RunQueryCtx,
 		args: { key: string },
 	): Promise<{
-		foldedText: string;
+		fields: Record<string, string>;
 		sortKey: number;
 		filters?: Record<string, FilterValue>;
 	} | null> {
@@ -168,7 +282,7 @@ export class SearchIndex<Filter extends string = never> {
 	 *
 	 * ```ts
 	 * let cursor: string | null = null;
-	 * do { ({ cursor } = await receipts.clear(ctx, { cursor })); } while (cursor !== null);
+	 * do { ({ cursor } = await notesSearch.clear(ctx, { cursor })); } while (cursor !== null);
 	 * ```
 	 * (Run the loop across scheduled mutations for large namespaces.)
 	 */
@@ -183,43 +297,134 @@ export class SearchIndex<Filter extends string = never> {
 	}
 
 	/**
-	 * A trigger for `convex-helpers/server/triggers`, keeping the index in
-	 * sync atomically with the table it watches:
-	 *
-	 * ```ts
-	 * const triggers = new Triggers<DataModel>();
-	 * triggers.register("feeEntries", receipts.trigger((doc) => ({
-	 *   key: doc._id,
-	 *   text: doc.note ?? "",
-	 *   sortKey: doc.createdAt,
-	 * })));
-	 * ```
-	 *
-	 * Return `null` from the mapper to keep a document out of the index
-	 * (e.g. archived rows) — it is then removed under its default key
-	 * (`doc._id`). When you use custom keys AND conditional indexing, handle
-	 * removal yourself instead of returning null.
+	 * Bind this index to one table with one mapper, and every sync path comes
+	 * for free: `sync(ctx, id)` after any write (works for hard deletes too),
+	 * `syncDoc(ctx, doc)` for backfill migrations, and `trigger()` for
+	 * `convex-helpers/server/triggers`. The mapper receives a query ctx, so
+	 * derived text (joins, counts) is fine; returning `null` keeps the
+	 * document out of the index (archived rows, wrong status…).
 	 */
-	trigger<D extends { _id: string }>(
-		map: (doc: D) => IndexEntry<Filter> | null,
-	): (ctx: RunMutationCtx, change: TriggerChange<D>) => Promise<void> {
+	tableIndexer<D extends { _id: string }>(options: {
+		table: string;
+		/** Index key for a document id. Default: the id itself. */
+		key?: (id: string) => string;
+		map: (
+			ctx: DbQueryCtx,
+			doc: D,
+		) => Omit<IndexEntry<Filter>, "key"> | null | Promise<Omit<IndexEntry<Filter>, "key"> | null>;
+	}): TableIndexer<D, Filter> {
+		return new TableIndexer(this, options);
+	}
+}
+
+export class TableIndexer<D extends { _id: string }, Filter extends string = never> {
+	constructor(
+		private readonly index: SearchIndex<Filter>,
+		private readonly options: {
+			table: string;
+			key?: (id: string) => string;
+			map: (
+				ctx: DbQueryCtx,
+				doc: D,
+			) =>
+				| Omit<IndexEntry<Filter>, "key">
+				| null
+				| Promise<Omit<IndexEntry<Filter>, "key"> | null>;
+		},
+	) {}
+
+	private keyOf(id: string): string {
+		return this.options.key === undefined ? id : this.options.key(id);
+	}
+
+	/**
+	 * Bring one document's index entry in line with the table — call once
+	 * after any write in the same mutation. A missing document (hard delete)
+	 * or a `null` mapping removes the entry; anything else upserts it.
+	 */
+	async sync(ctx: DbMutationCtx, id: string): Promise<void> {
+		const doc = await getDoc<D>(ctx, this.options.table, id);
+		await this.syncDoc(ctx, doc, id);
+	}
+
+	/** `sync` for callers already holding the document — e.g. a migration's `migrateOne`. */
+	async syncDoc(ctx: DbMutationCtx, doc: D | null, id?: string): Promise<void> {
+		const docId = doc?._id ?? id;
+		if (docId === undefined) {
+			throw new Error("syncDoc needs a document or an explicit id");
+		}
+		const entry = doc === null ? null : await this.options.map(ctx, doc);
+		if (entry === null) {
+			await this.index.remove(ctx, { key: this.keyOf(docId) });
+			return;
+		}
+		await this.index.set(ctx, { ...entry, key: this.keyOf(docId) });
+	}
+
+	/** Re-sync a batch of documents (e.g. every receipt of one dispatch after replanning). */
+	async syncMany(ctx: DbMutationCtx, ids: Iterable<string>): Promise<void> {
+		for (const id of ids) await this.sync(ctx, id);
+	}
+
+	/**
+	 * A trigger for `convex-helpers/server/triggers`, driven by the same
+	 * mapper: `triggers.register("notes", notesIndexer.trigger())`.
+	 */
+	trigger(): (ctx: DbMutationCtx, change: TriggerChange<D>) => Promise<void> {
 		return async (ctx, change) => {
 			if (change.operation === "delete") {
-				const oldEntry = change.oldDoc === null ? null : map(change.oldDoc);
-				const key = oldEntry?.key ?? change.oldDoc?._id ?? change.id;
-				await this.remove(ctx, { key });
+				await this.index.remove(ctx, { key: this.keyOf(change.id) });
 				return;
 			}
-			const doc = change.newDoc;
-			if (doc === null) return;
-			const entry = map(doc);
-			if (entry === null) {
-				await this.remove(ctx, { key: doc._id });
-				return;
-			}
-			await this.set(ctx, entry);
+			if (change.newDoc !== null) await this.syncDoc(ctx, change.newDoc);
 		};
 	}
+}
+
+/**
+ * Locate the folded query inside the original text — the highlight
+ * primitive. Folds codepoint by codepoint (same NFKC + lowercase as the
+ * index) and maps folded offsets back to original ones, so a half-width
+ * query highlights its full-width occurrence. Returns UTF-16 offsets
+ * `[start, end)`, or null when no occurrence can be located (a few
+ * combining sequences fold differently as a whole string — the match
+ * itself is still the index's call, not this function's).
+ */
+export function findFoldedRange(text: string, query: string): [number, number] | null {
+	const foldedQuery = fold(query);
+	if (!foldedQuery) return null;
+	let folded = "";
+	const originOf: number[] = [];
+	let origin = 0;
+	for (const ch of text) {
+		const foldedChar = fold(ch);
+		for (let i = 0; i < foldedChar.length; i += 1) originOf.push(origin);
+		folded += foldedChar;
+		origin += ch.length;
+	}
+	const at = folded.indexOf(foldedQuery);
+	if (at === -1) return null;
+	const start = originOf[at];
+	const lastOrigin = originOf[at + foldedQuery.length - 1];
+	const lastCp = text.codePointAt(lastOrigin);
+	return [start, lastOrigin + (lastCp !== undefined && lastCp > 0xffff ? 2 : 1)];
+}
+
+/**
+ * Split text into segments for highlighting the first match:
+ * `matchSegments("ＡＢＣ大樓", "abc")` → `[{text: "ＡＢＣ", match: true}, {text: "大樓", match: false}]`.
+ */
+export function matchSegments(
+	text: string,
+	query: string,
+): { text: string; match: boolean }[] {
+	const range = findFoldedRange(text, query);
+	if (range === null) return [{ text, match: false }];
+	const segments: { text: string; match: boolean }[] = [];
+	if (range[0] > 0) segments.push({ text: text.slice(0, range[0]), match: false });
+	segments.push({ text: text.slice(range[0], range[1]), match: true });
+	if (range[1] < text.length) segments.push({ text: text.slice(range[1]), match: false });
+	return segments;
 }
 
 /** An IndexEntry that also names the time shard (or any partition) it lives in. */
@@ -251,7 +456,7 @@ type ShardCursor = { shard: string; inner: string | null };
  *   return `${d.getUTCFullYear()}Q${Math.floor(d.getUTCMonth() / 3) + 1}`;
  * };
  *
- * // Writes: triggers.register("receipts", receipts.trigger((doc) => ({
+ * // Writes: triggers.register("receipts", receipts.trigger((ctx, doc) => ({
  * //   key: doc._id, text: doc.note, sortKey: doc.createdAt,
  * //   shard: shardOf(doc.createdAt),
  * // })));
@@ -311,14 +516,9 @@ export class ShardedSearchIndex<Filter extends string = never> {
 	 */
 	async search(
 		ctx: RunQueryCtx,
-		args: {
+		args: SearchArgs<Filter> & {
 			/** Live shard list, newest first. May grow between calls; a shard named by an in-flight cursor must still be present. */
 			shards: readonly string[];
-			query: string;
-			filters?: Partial<Record<Filter, FilterValue>>;
-			cursor?: string | null;
-			limit?: number;
-			budget?: number;
 		},
 	): Promise<SearchResultPage> {
 		const limit = args.limit ?? DEFAULT_LIMIT;
@@ -389,11 +589,14 @@ export class ShardedSearchIndex<Filter extends string = never> {
 	 * nothing to remove either.
 	 */
 	trigger<D extends { _id: string }>(
-		map: (doc: D) => ShardedIndexEntry<Filter> | null,
-	): (ctx: RunMutationCtx, change: TriggerChange<D>) => Promise<void> {
+		map: (
+			ctx: DbQueryCtx,
+			doc: D,
+		) => ShardedIndexEntry<Filter> | null | Promise<ShardedIndexEntry<Filter> | null>,
+	): (ctx: DbMutationCtx, change: TriggerChange<D>) => Promise<void> {
 		return async (ctx, change) => {
-			const oldEntry = change.oldDoc === null ? null : map(change.oldDoc);
-			const newEntry = change.newDoc === null ? null : map(change.newDoc);
+			const oldEntry = change.oldDoc === null ? null : await map(ctx, change.oldDoc);
+			const newEntry = change.newDoc === null ? null : await map(ctx, change.newDoc);
 			if (
 				oldEntry !== null &&
 				(newEntry === null ||

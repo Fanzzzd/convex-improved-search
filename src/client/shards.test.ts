@@ -166,7 +166,7 @@ describe("sharded trigger", () => {
 				mutations.push({ ref, args });
 			},
 		};
-		const trigger = index.trigger<Doc>((doc) =>
+		const trigger = index.trigger<Doc>((_ctx, doc) =>
 			doc.archived
 				? null
 				: {
@@ -201,7 +201,10 @@ describe("sharded trigger", () => {
 			newDoc: { _id: "r1", note: "停車場", createdAt: 150 },
 		});
 		expect(mutations).toHaveLength(1);
-		expect(mutations[0].args).toMatchObject({ namespace: "receipts/new", text: "停車場" });
+		expect(mutations[0].args).toMatchObject({
+			namespace: "receipts/new",
+			fields: [{ name: "text", value: "停車場" }],
+		});
 	});
 
 	test("a shard move removes from the old shard and sets in the new", async () => {

@@ -10,9 +10,17 @@ export const filterValueValidator = v.union(
 );
 export const filtersValidator = v.record(v.string(), filterValueValidator);
 
+/**
+ * Named searchable Fields, folded. Verification runs per field (a query
+ * never matches across a field boundary) and reports which fields hit.
+ * Field names follow Convex record-key rules (nonempty ASCII, no leading
+ * $/_); single-text entries live under the field name "text".
+ */
+export const foldedFieldsValidator = v.record(v.string(), v.string());
+
 export default defineSchema({
 	/**
-	 * One row per indexed document: the folded text (verification source and
+	 * One row per indexed document: the folded fields (verification source and
 	 * the only text we ever compare against), the caller's sort key, and the
 	 * exact-match filter values. `key` is the caller's identifier — typically
 	 * their document `_id`, but any string.
@@ -20,7 +28,7 @@ export default defineSchema({
 	docs: defineTable({
 		namespace: v.string(),
 		key: v.string(),
-		foldedText: v.string(),
+		fields: foldedFieldsValidator,
 		sortKey: v.number(),
 		filters: v.optional(filtersValidator),
 	}).index("by_ns_key", ["namespace", "key"]),

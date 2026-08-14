@@ -76,6 +76,15 @@ export function queryGrams(foldedQuery: string): string[] {
 }
 
 /** First codepoint of a gram (codepoint-safe: never half a surrogate pair). */
+/** Union of documentGrams over each field's folded text — grams never span field boundaries. */
+export function documentGramsOfFields(fields: Record<string, string>): Set<string> {
+	const grams = new Set<string>();
+	for (const value of Object.values(fields)) {
+		for (const gram of documentGrams(value)) grams.add(gram);
+	}
+	return grams;
+}
+
 export function firstCodepoint(gram: string): string {
 	const first = gram.codePointAt(0);
 	// Grams are never empty; guard for type narrowing only.

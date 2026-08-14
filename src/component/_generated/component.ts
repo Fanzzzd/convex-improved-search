@@ -36,8 +36,8 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { key: string; namespace: string },
         {
+          fields: Record<string, string>;
           filters?: Record<string, string | number | boolean | null>;
-          foldedText: string;
           sortKey: number;
         } | null,
         Name
@@ -63,7 +63,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           cursor: string | null;
           isDone: boolean;
-          page: Array<{ key: string; sortKey: number }>;
+          page: Array<{ key: string; matchedFields: Array<string>; sortKey: number }>;
         },
         Name
       >;
@@ -71,12 +71,12 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
+          fields: Array<{ name: string; value: string }>;
           filters?: Record<string, string | number | boolean | null>;
           key: string;
           namespace: string;
           onOverflow?: "truncate" | "error";
           sortKey: number;
-          text: string;
         },
         null,
         Name

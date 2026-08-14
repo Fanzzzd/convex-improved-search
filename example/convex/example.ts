@@ -1,5 +1,6 @@
 import { mutation, query } from "./_generated/server.js";
 import { components } from "./_generated/api.js";
+import type { Doc } from "./_generated/dataModel.js";
 import { SearchIndex } from "convex-improved-search";
 import { v } from "convex/values";
 
@@ -12,21 +13,29 @@ export const notesSearch = new SearchIndex(components.improvedSearch, {
 	filterFields: ["category"],
 });
 
+/**
+ * One mapper binds the index to the table; every sync path derives from it.
+ * After any write, `notesIndexer.sync(ctx, id)` reads the row and upserts or
+ * removes the entry — hard deletes included.
+ */
+export const notesIndexer = notesSearch.tableIndexer<Doc<"notes">>({
+	table: "notes",
+	map: (_ctx, note) => ({
+		text: note.text,
+		sortKey: note.createdAt,
+		filters: { category: note.category },
+	}),
+});
+
 export const addNote = mutation({
 	args: {
 		text: v.string(),
 		category: v.union(v.literal("work"), v.literal("personal")),
 	},
 	handler: async (ctx, args) => {
-		const createdAt = Date.now();
-		const noteId = await ctx.db.insert("notes", { ...args, createdAt });
+		const noteId = await ctx.db.insert("notes", { ...args, createdAt: Date.now() });
 		// Same transaction as the insert — the index can never drift.
-		await notesSearch.set(ctx, {
-			key: noteId,
-			text: args.text,
-			sortKey: createdAt,
-			filters: { category: args.category },
-		});
+		await notesIndexer.sync(ctx, noteId);
 		return noteId;
 	},
 });
@@ -34,15 +43,8 @@ export const addNote = mutation({
 export const updateNote = mutation({
 	args: { noteId: v.id("notes"), text: v.string() },
 	handler: async (ctx, args) => {
-		const note = await ctx.db.get("notes", args.noteId);
-		if (note === null) throw new Error("note not found");
 		await ctx.db.patch("notes", args.noteId, { text: args.text });
-		await notesSearch.set(ctx, {
-			key: args.noteId,
-			text: args.text,
-			sortKey: note.createdAt,
-			filters: { category: note.category },
-		});
+		await notesIndexer.sync(ctx, args.noteId);
 	},
 });
 
@@ -50,14 +52,15 @@ export const deleteNote = mutation({
 	args: { noteId: v.id("notes") },
 	handler: async (ctx, args) => {
 		await ctx.db.delete("notes", args.noteId);
-		await notesSearch.remove(ctx, { key: args.noteId });
+		await notesIndexer.sync(ctx, args.noteId);
 	},
 });
 
 /**
  * Exact substring search — CJK, emoji, whatever. Reactive like any Convex
- * query. A non-null cursor with a short page means "budget spent, keep
- * paging"; only isDone means exhausted.
+ * query. `searchDocs` hydrates hits from the table in one call. A non-null
+ * cursor with a short page means "budget spent, keep paging"; only isDone
+ * means exhausted.
  */
 export const searchNotes = query({
 	args: {
@@ -66,20 +69,19 @@ export const searchNotes = query({
 		cursor: v.optional(v.union(v.string(), v.null())),
 	},
 	handler: async (ctx, args) => {
-		const result = await notesSearch.search(ctx, {
+		const result = await notesSearch.searchDocs<Doc<"notes">>(ctx, {
+			table: "notes",
 			query: args.query,
 			filters: args.category === undefined ? undefined : { category: args.category },
 			cursor: args.cursor,
 			limit: 20,
 		});
-		const page = await Promise.all(
-			result.page.map(async ({ key }) => {
-				const note = await ctx.db.get("notes", key as import("./_generated/dataModel.js").Id<"notes">);
-				return note === null ? null : { _id: note._id, text: note.text, category: note.category };
-			}),
-		);
 		return {
-			page: page.filter((note) => note !== null),
+			page: result.page.map(({ doc }) => ({
+				_id: doc._id,
+				text: doc.text,
+				category: doc.category,
+			})),
 			cursor: result.cursor,
 			isDone: result.isDone,
 		};
