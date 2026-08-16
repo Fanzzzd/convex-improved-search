@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/Fanzzzd/convex-improved-search/compare/v0.2.0...v0.2.1) (2026-08-16)
+
+
+### Bug Fixes
+
+* harden search bounds and release packaging ([536101c](https://github.com/Fanzzzd/convex-improved-search/commit/536101c02efb0161abdf7d683dd7ca65e68bd506))
+
 ## 0.2.0
 
 - Multi-field entries: `text` accepts named fields; a match never spans a
