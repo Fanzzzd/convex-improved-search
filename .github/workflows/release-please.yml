@@ -41,12 +41,14 @@ jobs:
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
 
+      # No registry-url on purpose: trusted publishing authenticates via
+      # OIDC, and setup-node's token-templated .npmrc would only add an
+      # empty-auth ambiguity.
       - name: Node setup
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24.x"
-          registry-url: "https://registry.npmjs.org"
-          cache-dependency-path: package.json
+          cache-dependency-path: package-lock.json
           cache: "npm"
 
       # Trusted publishing needs npm >= 11.5.1.

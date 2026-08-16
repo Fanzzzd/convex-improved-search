@@ -320,6 +320,19 @@ npm run lint
 
 A runnable demo lives in [example/](./example/) — a Vite + React app.
 
+### Releasing
+
+Conventional commits drive the pipeline: `feat` / `fix` (and breaking `!`)
+commits on `main` make [release-please](https://github.com/googleapis/release-please)
+open or refresh a release PR with the version bump and changelog. Merging
+that PR tags the release; the workflow then rebuilds, re-runs the full
+test gate, and publishes to npm via
+[trusted publishing](https://docs.npmjs.com/trusted-publishers) (GitHub
+OIDC — no tokens, provenance included). There is no manual publish path.
+Caveat: the release PR itself doesn't trigger the PR test workflow
+(GitHub doesn't run workflows on `GITHUB_TOKEN`-created PRs); the publish
+job's own gate covers it.
+
 ## License
 
 Apache-2.0
