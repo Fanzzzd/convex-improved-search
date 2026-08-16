@@ -14,11 +14,21 @@ const component = {
 type Row = { key: string; sortKey: number; text: string };
 
 function makeCtx(corpus: Record<string, Row[]>) {
-	const calls: { namespace: string; cursor: string | null | undefined }[] = [];
+	const calls: {
+		namespace: string;
+		cursor: string | null | undefined;
+		limit: number | undefined;
+		budget: number | undefined;
+	}[] = [];
 	const ctx = {
 		runQuery: async (_ref: unknown, args: Record<string, unknown>) => {
 			const namespace = args.namespace as string;
-			calls.push({ namespace, cursor: args.cursor as string | null | undefined });
+			calls.push({
+				namespace,
+				cursor: args.cursor as string | null | undefined,
+				limit: args.limit as number | undefined,
+				budget: args.budget as number | undefined,
+			});
 			const rows = (corpus[namespace] ?? [])
 				.filter((r) => r.text.includes(args.query as string))
 				.sort((a, b) => b.sortKey - a.sortKey || (a.key < b.key ? 1 : -1));
@@ -153,6 +163,34 @@ describe("sharded search", () => {
 		// Default budget visits at most 3 shards per call → 5 empty shards need 2 calls.
 		expect(calls.length).toBe(5);
 	});
+
+	test("uses the effective child budget to cap shards visited per call", async () => {
+		const { ctx, calls } = makeCtx({});
+		const shards = Array.from({ length: 8 }, (_, i) => `s${i}`);
+		const first = await makeIndex().search(ctx as never, {
+			shards,
+			query: "x",
+			limit: 200,
+			budget: 1,
+		});
+		expect(first.isDone).toBe(false);
+		expect(calls).toHaveLength(3);
+		expect(calls.every((call) => call.budget === 200)).toBe(true);
+	});
+
+	test.each([Number.NaN, Number.POSITIVE_INFINITY])(
+		"rejects non-finite sharded controls (%s)",
+		async (value) => {
+			const { ctx } = makeCtx({});
+			await expect(
+				makeIndex().search(ctx as never, {
+					shards: ["s"],
+					query: "x",
+					limit: value,
+				}),
+			).rejects.toThrow(/finite number/);
+		},
+	);
 });
 
 describe("sharded trigger", () => {

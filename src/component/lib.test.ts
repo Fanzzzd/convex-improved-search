@@ -140,6 +140,12 @@ describe("substring semantics", () => {
 		expect(await searchAll(t, "")).toEqual([]);
 	});
 
+	test("a query longer than any indexed field terminates without scanning", async () => {
+		const t = initConvexTest();
+		await seed(t, corpus);
+		expect(await searchAll(t, "界".repeat(4097))).toEqual([]);
+	});
+
 	test("combining-mark input form does not matter (fts5trigram2 block 1 analog)", async () => {
 		const t = initConvexTest();
 		await seed(t, [{ key: "d", fields: asFields("pin\u0303ata"), sortKey: 1 }]); // decomposed n + combining tilde
@@ -267,6 +273,53 @@ describe("filters", () => {
 		]);
 		expect(await searchAll(t, "xyz", { filters: { category: null } })).toEqual(["a"]);
 	});
+
+	test("rejects non-finite numeric filters on writes and reads", async () => {
+		const t = initConvexTest();
+		await expect(
+			t.mutation(api.lib.set, {
+				namespace: NS,
+				key: "bad-filter",
+				fields: asFields("停車"),
+				sortKey: 1,
+				filters: { score: Number.NaN },
+			}),
+		).rejects.toThrow(/Filter "score" must be a finite number/);
+		await expect(
+			t.query(api.lib.search, {
+				namespace: NS,
+				query: "停車",
+				filters: { score: Number.POSITIVE_INFINITY },
+			}),
+		).rejects.toThrow(/Filter "score" must be a finite number/);
+	});
+});
+
+describe("numeric bounds", () => {
+	test.each([
+		["limit", { limit: Number.NaN }],
+		["budget", { budget: Number.POSITIVE_INFINITY }],
+	] as const)("rejects a non-finite %s", async (_name, controls) => {
+		const t = initConvexTest();
+		await expect(
+			t.query(api.lib.search, { namespace: NS, query: "停車", ...controls }),
+		).rejects.toThrow(/must be a finite number/);
+	});
+
+	test.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+		"rejects non-finite sortKey %s before writing",
+		async (sortKey) => {
+			const t = initConvexTest();
+			await expect(
+				t.mutation(api.lib.set, {
+					namespace: NS,
+					key: "bad-sort",
+					fields: asFields("停車"),
+					sortKey,
+				}),
+			).rejects.toThrow(/sortKey must be a finite number/);
+		},
+	);
 });
 
 describe("updates and removal", () => {

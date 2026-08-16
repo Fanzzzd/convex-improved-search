@@ -29,6 +29,7 @@ jobs:
         run: |
           npm ci
           npm run build
+          npm run verify:package
       - name: Publish package for testing branch
         run: npx pkg-pr-new publish || echo "pkg-pr-new failed"
       - name: Test

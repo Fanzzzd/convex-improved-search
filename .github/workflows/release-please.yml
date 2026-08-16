@@ -7,6 +7,13 @@ name: Release
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description:
+          Existing release tag to retry publishing (for example v0.2.1)
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -18,28 +25,40 @@ concurrency:
 
 jobs:
   release-please:
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
         id: release
         with:
           release-type: node
 
   publish:
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created }}
+    if:
+      ${{ always() && (needs.release-please.outputs.release_created == 'true' ||
+      github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
       id-token: write # OIDC for npm trusted publishing
+    env:
+      RELEASE_TAG:
+        ${{ github.event_name == 'workflow_dispatch' && inputs.tag ||
+        needs.release-please.outputs.tag_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Verify immutable release version
+        run: |
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")"
+          node -e 'const p=require("./package.json"); if (process.env.RELEASE_TAG !== `v${p.version}`) throw new Error(`Tag ${process.env.RELEASE_TAG} does not match package version ${p.version}`)'
 
       # No registry-url on purpose: trusted publishing authenticates via
       # OIDC, and setup-node's token-templated .npmrc would only add an
@@ -48,8 +67,6 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24.x"
-          cache-dependency-path: package-lock.json
-          cache: "npm"
 
       # Trusted publishing needs npm >= 11.5.1.
       - name: Update npm
@@ -59,6 +76,7 @@ jobs:
         run: |
           npm ci
           npm run build:clean
+          npm run verify:package
 
       - name: Gate on tests
         run: |

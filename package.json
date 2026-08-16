@@ -1,6 +1,6 @@
 {
   "name": "convex-improved-search",
-  "description": "A improved search component for Convex.",
+  "description": "An improved search component for Convex.",
   "repository": "github:Fanzzzd/convex-improved-search",
   "homepage": "https://github.com/Fanzzzd/convex-improved-search#readme",
   "bugs": {
@@ -20,13 +20,14 @@
     "predev": "convex init && npm run build:codegen",
     "build": "tsc --project ./tsconfig.build.json",
     "build:codegen": "npx convex codegen --component-dir ./src/component && npm run build",
-    "build:clean": "rm -rf dist *.tsbuildinfo && npm run build:codegen",
+    "build:clean": "rm -rf ./dist ./*.tsbuildinfo && npm run build",
     "typecheck": "tsc --noEmit && tsc -p example && tsc -p example/convex",
     "lint": "eslint .",
     "test": "vitest run --typecheck",
     "test:watch": "vitest --typecheck --clearScreen false",
     "test:debug": "vitest --inspect-brk --no-file-parallelism",
     "test:coverage": "vitest run --coverage --coverage.reporter=text",
+    "verify:package": "node ./scripts/verify-package.mjs",
     "prepare": "npm run build"
   },
   "files": [
@@ -38,10 +39,6 @@
     ".": {
       "types": "./dist/client/index.d.ts",
       "default": "./dist/client/index.js"
-    },
-    "./react": {
-      "types": "./dist/react/index.d.ts",
-      "default": "./dist/react/index.js"
     },
     "./test": "./src/test.ts",
     "./_generated/component.js": {
@@ -60,8 +57,7 @@
     }
   },
   "peerDependencies": {
-    "convex": "^1.43.0",
-    "react": "^18.3.1 || ^19.0.0"
+    "convex": "^1.43.0"
   },
   "devDependencies": {
     "@convex-dev/eslint-plugin": "^3.0.0",

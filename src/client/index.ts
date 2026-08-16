@@ -11,6 +11,25 @@ export type FilterValue = string | number | boolean | null;
 /** Mirror the component's defaults (used for client-side bookkeeping only). */
 const DEFAULT_LIMIT = 50;
 const DEFAULT_SCAN_BUDGET = 256;
+const MAX_LIMIT = 200;
+const MAX_SCAN_BUDGET = 768;
+
+function normalizeSearchLimit(raw: number | undefined): number {
+	if (raw !== undefined && !Number.isFinite(raw)) {
+		throw new Error("Search limit must be a finite number");
+	}
+	return Math.max(1, Math.min(Math.floor(raw ?? DEFAULT_LIMIT), MAX_LIMIT));
+}
+
+function normalizeSearchBudget(raw: number | undefined, limit: number): number {
+	if (raw !== undefined && !Number.isFinite(raw)) {
+		throw new Error("Search budget must be a finite number");
+	}
+	return Math.max(
+		limit,
+		Math.min(Math.floor(raw ?? DEFAULT_SCAN_BUDGET), MAX_SCAN_BUDGET),
+	);
+}
 
 export type SearchHit = {
 	key: string;
@@ -528,14 +547,20 @@ export class ShardedSearchIndex<Filter extends string = never> {
 			shards: readonly string[];
 		},
 	): Promise<SearchResultPage> {
-		const limit = args.limit ?? DEFAULT_LIMIT;
+		const limit = normalizeSearchLimit(args.limit);
+		const budget = normalizeSearchBudget(args.budget, limit);
 		let start = 0;
 		let inner: string | null = null;
 		if (args.cursor != null) {
 			let parsed: ShardCursor;
 			try {
 				parsed = JSON.parse(args.cursor) as ShardCursor;
-				if (typeof parsed.shard !== "string") throw new Error("bad shape");
+				if (
+					typeof parsed.shard !== "string" ||
+					(parsed.inner !== null && typeof parsed.inner !== "string")
+				) {
+					throw new Error("bad shape");
+				}
 			} catch {
 				throw new Error("Invalid sharded search cursor");
 			}
@@ -550,7 +575,6 @@ export class ShardedSearchIndex<Filter extends string = never> {
 
 		// Each drained shard can cost up to ~budget*4 reads inside the shared
 		// transaction, so bound the shards visited per call accordingly.
-		const budget = args.budget ?? DEFAULT_SCAN_BUDGET;
 		const maxShards = Math.max(1, Math.min(8, Math.floor(3072 / (budget * 4))));
 
 		const page: SearchResultPage["page"] = [];
@@ -567,7 +591,7 @@ export class ShardedSearchIndex<Filter extends string = never> {
 				filters: args.filters,
 				cursor: i === start ? inner : null,
 				limit: limit - page.length,
-				budget: args.budget,
+				budget,
 			});
 			page.push(...result.page);
 			if (!result.isDone) {

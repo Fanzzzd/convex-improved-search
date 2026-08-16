@@ -70,12 +70,41 @@ function decodeCursor(raw: string | null | undefined): Cursor | null {
 	if (raw == null) return null;
 	try {
 		const parsed = JSON.parse(raw) as Cursor;
-		if (typeof parsed.s !== "number" || typeof parsed.k !== "string") {
+		if (
+			typeof parsed.s !== "number" ||
+			!Number.isFinite(parsed.s) ||
+			typeof parsed.k !== "string"
+		) {
 			throw new Error("bad shape");
 		}
 		return parsed;
 	} catch {
 		throw new ConvexError("Invalid search cursor");
+	}
+}
+
+function normalizeLimit(raw: number | undefined): number {
+	if (raw !== undefined && !Number.isFinite(raw)) {
+		throw new ConvexError("Search limit must be a finite number");
+	}
+	return Math.max(1, Math.min(Math.floor(raw ?? DEFAULT_LIMIT), MAX_LIMIT));
+}
+
+function normalizeBudget(raw: number | undefined, limit: number): number {
+	if (raw !== undefined && !Number.isFinite(raw)) {
+		throw new ConvexError("Search budget must be a finite number");
+	}
+	return Math.max(
+		limit,
+		Math.min(Math.floor(raw ?? DEFAULT_SCAN_BUDGET), MAX_SCAN_BUDGET),
+	);
+}
+
+function assertFiniteFilters(filters: Record<string, string | number | boolean | null> | undefined) {
+	for (const [field, value] of Object.entries(filters ?? {})) {
+		if (typeof value === "number" && !Number.isFinite(value)) {
+			throw new ConvexError(`Filter "${field}" must be a finite number`);
+		}
 	}
 }
 
@@ -96,16 +125,24 @@ export const search = query({
 	},
 	returns: searchResultValidator,
 	handler: async (ctx, args) => {
+		const limit = normalizeLimit(args.limit);
+		const budget = normalizeBudget(args.budget, limit);
+		assertFiniteFilters(args.filters);
 		const folded = fold(args.query);
-		const codepoints = Array.from(folded);
-		if (codepoints.length === 0) {
+		// Indexed fields can never exceed this bound, so a longer query is
+		// impossible to satisfy. Count only to the bound before allocating an
+		// array or the much larger deduplicated bigram set.
+		let codepointCount = 0;
+		for (const _codepoint of folded) {
+			codepointCount += 1;
+			if (codepointCount > MAX_TEXT_LENGTH) {
+				return { page: [], cursor: null, isDone: true };
+			}
+		}
+		if (codepointCount === 0) {
 			return { page: [], cursor: null, isDone: true };
 		}
-		const limit = Math.max(1, Math.min(args.limit ?? DEFAULT_LIMIT, MAX_LIMIT));
-		const budget = Math.max(
-			limit,
-			Math.min(args.budget ?? DEFAULT_SCAN_BUDGET, MAX_SCAN_BUDGET),
-		);
+		const codepoints = Array.from(folded);
 		const cursor = decodeCursor(args.cursor);
 		const wantedFilters = Object.entries(args.filters ?? {});
 
@@ -166,6 +203,11 @@ export const search = query({
 		let exhausted = true;
 		const seen = new Set<string>();
 		for await (const posting of stream) {
+			if (!Number.isFinite(posting.sortKey)) {
+				throw new ConvexError(
+					`Indexed document "${posting.key}" has a non-finite sortKey; re-set or remove it`,
+				);
+			}
 			if (coveredByCursor(cursor, posting.sortKey, posting.key)) continue;
 			// Skipped duplicates cost a streamed row but no reads, so they get
 			// their own (generous) cap instead of the scan budget. Checked
@@ -266,6 +308,10 @@ export const set = mutation({
 	},
 	returns: v.null(),
 	handler: async (ctx, args) => {
+		if (!Number.isFinite(args.sortKey)) {
+			throw new ConvexError("sortKey must be a finite number");
+		}
+		assertFiniteFilters(args.filters);
 		// Fold each field and spend one shared codepoint budget across them in
 		// the order given: the overflowing field is cut, later fields dropped.
 		const foldedFields: Record<string, string> = {};
