@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/Fanzzzd/convex-improved-search/compare/v0.2.1...v0.3.0) (2026-10-20)
+
+
+### Features
+
+* the trigger skips updates whose indexed entry is unchanged ([#2](https://github.com/Fanzzzd/convex-improved-search/issues/2)) ([7306392](https://github.com/Fanzzzd/convex-improved-search/commit/7306392287a25e31c3bc3a07fdcd0dbd33f96a36))
+
 ## [0.2.1](https://github.com/Fanzzzd/convex-improved-search/compare/v0.2.0...v0.2.1) (2026-08-16)
 
 
