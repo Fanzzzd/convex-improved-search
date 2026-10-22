@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/Fanzzzd/convex-improved-search/compare/v0.3.0...v0.4.0) (2026-10-22)
+
+
+### Features
+
+* fill option for search/searchDocs; set skips the posting diff when text is unchanged ([#5](https://github.com/Fanzzzd/convex-improved-search/issues/5)) ([5af1c41](https://github.com/Fanzzzd/convex-improved-search/commit/5af1c41dfc517973a39095fdd909010b1a48d090)), closes [#4](https://github.com/Fanzzzd/convex-improved-search/issues/4)
+
 ## [0.3.0](https://github.com/Fanzzzd/convex-improved-search/compare/v0.2.1...v0.3.0) (2026-10-20)
 
 
