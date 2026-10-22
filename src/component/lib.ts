@@ -58,6 +58,8 @@ const searchResultValidator = v.object({
 	/** Pass back to continue. Non-null with an unfilled page means "budget spent, keep paging". */
 	cursor: v.union(v.string(), v.null()),
 	isDone: v.boolean(),
+	/** Distinct candidates examined this call (≤ budget); lets callers cap a multi-call fill. */
+	scanned: v.number(),
 });
 
 type Cursor = { s: number; k: string };
@@ -136,11 +138,11 @@ export const search = query({
 		for (const _codepoint of folded) {
 			codepointCount += 1;
 			if (codepointCount > MAX_TEXT_LENGTH) {
-				return { page: [], cursor: null, isDone: true };
+				return { page: [], cursor: null, isDone: true, scanned: 0 };
 			}
 		}
 		if (codepointCount === 0) {
-			return { page: [], cursor: null, isDone: true };
+			return { page: [], cursor: null, isDone: true, scanned: 0 };
 		}
 		const codepoints = Array.from(folded);
 		const cursor = decodeCursor(args.cursor);
@@ -249,6 +251,7 @@ export const search = query({
 			page,
 			cursor: exhausted || last === null ? null : encodeCursor(last),
 			isDone: exhausted,
+			scanned,
 		};
 	},
 });
@@ -352,6 +355,19 @@ export const set = mutation({
 			...(args.filters === undefined ? {} : { filters: args.filters }),
 		};
 		if (existing !== null) {
+			// Same folded text and sortKey means the postings already match:
+			// skip the posting read (up to ~4096 rows) and, when nothing at all
+			// changed, the doc write too, so live searches do not rerun. Any
+			// leftover duplicates belong to a reap that is already scheduled.
+			const postingsCurrent =
+				existing.sortKey === args.sortKey &&
+				sameFields(existing.fields, foldedFields);
+			if (postingsCurrent) {
+				if (!sameFilters(existing.filters, args.filters)) {
+					await ctx.db.replace("docs", existing._id, docRow);
+				}
+				return null;
+			}
 			await ctx.db.replace("docs", existing._id, docRow);
 		} else {
 			await ctx.db.insert("docs", docRow);
@@ -421,6 +437,25 @@ export const set = mutation({
 		return null;
 	},
 });
+
+function sameFields(a: Record<string, string>, b: Record<string, string>): boolean {
+	const names = Object.keys(a);
+	return (
+		names.length === Object.keys(b).length &&
+		names.every((name) => Object.hasOwn(b, name) && a[name] === b[name])
+	);
+}
+
+type Filters = Record<string, string | number | boolean | null>;
+
+function sameFilters(a: Filters | undefined, b: Filters | undefined): boolean {
+	if (a === undefined || b === undefined) return a === b;
+	const names = Object.keys(a);
+	return (
+		names.length === Object.keys(b).length &&
+		names.every((name) => Object.hasOwn(b, name) && Object.is(a[name], b[name]))
+	);
+}
 
 export const remove = mutation({
 	args: { namespace: v.string(), key: v.string() },

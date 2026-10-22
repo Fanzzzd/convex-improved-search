@@ -64,6 +64,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           cursor: string | null;
           isDone: boolean;
           page: Array<{ key: string; matchedFields: Array<string>; sortKey: number }>;
+          scanned: number;
         },
         Name
       >;

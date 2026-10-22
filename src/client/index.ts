@@ -17,6 +17,13 @@ const DEFAULT_LIMIT = 50;
 const DEFAULT_SCAN_BUDGET = 256;
 const MAX_LIMIT = 200;
 const MAX_SCAN_BUDGET = 768;
+/**
+ * `fill` bounds: total candidates scanned across all calls (each costs up to
+ * 4 index ranges, so ~3072 of the 4096 per transaction) and calls per fill.
+ * The call cap bounds rows streamed past duplicates, which `scanned` omits.
+ */
+const FILL_SCAN_BUDGET = MAX_SCAN_BUDGET;
+const MAX_FILL_CALLS = 4;
 
 function normalizeSearchLimit(raw: number | undefined): number {
   if (raw !== undefined && !Number.isFinite(raw)) {
@@ -79,8 +86,18 @@ export type SearchArgs<Filter extends string = never> = {
   filters?: Partial<Record<Filter, FilterValue>>;
   cursor?: string | null;
   limit?: number;
-  /** Max candidate postings scanned this call. Raise for very selective filters. */
+  /**
+   * Max candidate postings scanned this call. Raise for very selective
+   * filters. Under `fill`, the cap across all calls (default and maximum 768).
+   */
   budget?: number;
+  /**
+   * Keep paging inside the call until the page holds `limit` hits, the
+   * search is done, or the scan cap is spent. The returned cursor resumes
+   * after the last scanned row, as without `fill`; `isDone` stays the only
+   * end-of-results signal.
+   */
+  fill?: boolean;
 };
 
 /** The `paginationOpts` shape Convex clients (e.g. usePaginatedQuery) send. */
@@ -208,6 +225,13 @@ export class SearchIndex<Filter extends string = never> {
     ctx: RunQueryCtx,
     args: SearchArgs<Filter>,
   ): Promise<SearchResultPage> {
+    return await this.collect(ctx, args, async (hits) => hits);
+  }
+
+  private async searchOnce(
+    ctx: RunQueryCtx,
+    args: Omit<SearchArgs<Filter>, "fill">,
+  ): Promise<SearchResultPage & { scanned: number }> {
     return await ctx.runQuery(this.component.lib.search, {
       namespace: this.options.name,
       query: args.query,
@@ -219,9 +243,53 @@ export class SearchIndex<Filter extends string = never> {
   }
 
   /**
+   * One component call, or under `fill` up to MAX_FILL_CALLS of them, each
+   * page passed through `hydrate` (which may drop hits) before counting.
+   */
+  private async collect<H>(
+    ctx: RunQueryCtx,
+    args: SearchArgs<Filter>,
+    hydrate: (hits: SearchHit[]) => Promise<H[]>,
+  ): Promise<{ page: H[]; cursor: string | null; isDone: boolean }> {
+    const { fill, ...once } = args;
+    if (!fill) {
+      const { page, cursor, isDone } = await this.searchOnce(ctx, once);
+      return { page: await hydrate(page), cursor, isDone };
+    }
+    const limit = normalizeSearchLimit(args.limit);
+    let remaining =
+      args.budget === undefined
+        ? FILL_SCAN_BUDGET
+        : normalizeSearchBudget(args.budget, limit);
+    const page: H[] = [];
+    let cursor = args.cursor ?? null;
+    let isDone = false;
+    for (let calls = 0; calls < MAX_FILL_CALLS; calls += 1) {
+      const wanted = limit - page.length;
+      const result = await this.searchOnce(ctx, {
+        ...once,
+        cursor,
+        // The component raises budget to at least limit; keep both under
+        // the remaining cap so the total never exceeds it.
+        limit: Math.min(wanted, remaining),
+        budget: remaining,
+      });
+      page.push(...(await hydrate(result.page)));
+      cursor = result.cursor;
+      isDone = result.isDone;
+      remaining -= result.scanned;
+      if (isDone || cursor === null || page.length >= limit || remaining <= 0) {
+        break;
+      }
+    }
+    return { page, cursor, isDone };
+  }
+
+  /**
    * Search + hydrate in one call, for the common case where `key` is a
    * document `_id` of one table. Keys whose document is gone are dropped
-   * (the page may come up short; the cursor contract is unchanged).
+   * (the page may come up short; the cursor contract is unchanged). With
+   * `fill`, dropped keys count as misses and paging continues.
    */
   async searchDocs<D>(
     ctx: DbQueryCtx,
@@ -231,19 +299,18 @@ export class SearchIndex<Filter extends string = never> {
     cursor: string | null;
     isDone: boolean;
   }> {
-    const result = await this.search(ctx, args);
-    const page: { doc: D; sortKey: number; matchedFields: string[] }[] = [];
-    for (const hit of result.page) {
-      const doc = await getDoc<D>(ctx, args.table, hit.key);
-      if (doc !== null) {
-        page.push({
-          doc,
-          sortKey: hit.sortKey,
-          matchedFields: hit.matchedFields,
-        });
-      }
-    }
-    return { page, cursor: result.cursor, isDone: result.isDone };
+    const { table, ...searchArgs } = args;
+    return await this.collect(ctx, searchArgs, async (hits) => {
+      const docs = await Promise.all(
+        hits.map((hit) => getDoc<D>(ctx, table, hit.key)),
+      );
+      return hits.flatMap((hit, i) => {
+        const doc = docs[i];
+        return doc === null
+          ? []
+          : [{ doc, sortKey: hit.sortKey, matchedFields: hit.matchedFields }];
+      });
+    });
   }
 
   /**
@@ -416,9 +483,9 @@ export class TableIndexer<
    * A trigger for `convex-helpers/server/triggers`, driven by the same
    * mapper: `triggers.register("notes", notesIndexer.trigger())`.
    *
-   * An update whose mapped entry is unchanged is skipped: `set` is
-   * idempotent, but it reads every posting of the document to diff them,
-   * and most writes to an indexed table (a status flip, a counter, a
+   * An update whose mapped entry is unchanged is skipped: `set` would
+   * find nothing to do, but it still costs a component call and a row
+   * read, and most writes to an indexed table (a status flip, a counter, a
    * reorder) touch no indexed text. The mapper runs on the old document
    * too, so a mapper that reads other tables pays that read twice on an
    * update. Pass `{ skipUnchanged: false }` to sync on every write, for
@@ -620,7 +687,7 @@ export class ShardedSearchIndex<Filter extends string = never> {
    */
   async search(
     ctx: RunQueryCtx,
-    args: SearchArgs<Filter> & {
+    args: Omit<SearchArgs<Filter>, "fill"> & {
       /** Live shard list, newest first. May grow between calls; a shard named by an in-flight cursor must still be present. */
       shards: readonly string[];
     },
