@@ -246,6 +246,97 @@ describe("searchDocs / searchPaginated", () => {
   });
 });
 
+describe("fill", () => {
+  type Hit = { key: string; sortKey: number; matchedFields: string[] };
+  type Page = { page: Hit[]; cursor: string | null; isDone: boolean; scanned: number };
+  const hit = (key: string, sortKey: number): Hit => ({ key, sortKey, matchedFields: ["note"] });
+
+  /** runQuery serves the scripted pages in order and records each call's args. */
+  function scripted(rows: Record<string, Note>, pages: Page[]) {
+    const calls: Record<string, unknown>[] = [];
+    const ctx = {
+      db: { get: async (_table: string, id: string) => rows[id] ?? null },
+      runQuery: async (_ref: unknown, args: Record<string, unknown>) => {
+        calls.push(args);
+        const next = pages.shift();
+        if (next === undefined) throw new Error("unexpected search call");
+        return next;
+      },
+    };
+    return { ctx, calls };
+  }
+
+  test("keeps paging until the page is full, carrying the cursor", async () => {
+    const index = new SearchIndex(component, { name: "notes" });
+    const { ctx, calls } = scripted({}, [
+      { page: [hit("a", 9)], cursor: "c1", isDone: false, scanned: 100 },
+      { page: [], cursor: "c2", isDone: false, scanned: 200 },
+      { page: [hit("b", 5), hit("c", 4)], cursor: "c3", isDone: false, scanned: 50 },
+    ]);
+    const result = await index.search(ctx as never, { query: "x", limit: 3, fill: true });
+    expect(result).toEqual({
+      page: [hit("a", 9), hit("b", 5), hit("c", 4)],
+      cursor: "c3",
+      isDone: false,
+    });
+    expect(calls.map((c) => [c.cursor, c.limit, c.budget])).toEqual([
+      [null, 3, 768],
+      ["c1", 2, 668],
+      ["c2", 2, 468],
+    ]);
+  });
+
+  test("stops when the index is done or the scan cap is spent", async () => {
+    const index = new SearchIndex(component, { name: "notes" });
+    const done = scripted({}, [
+      { page: [hit("a", 9)], cursor: "c1", isDone: false, scanned: 10 },
+      { page: [], cursor: null, isDone: true, scanned: 3 },
+    ]);
+    expect(
+      await index.search(done.ctx as never, { query: "x", limit: 5, fill: true }),
+    ).toEqual({ page: [hit("a", 9)], cursor: null, isDone: true });
+
+    const capped = scripted({}, [
+      { page: [], cursor: "c1", isDone: false, scanned: 60 },
+      { page: [hit("a", 9)], cursor: "c2", isDone: false, scanned: 40 },
+    ]);
+    const result = await index.search(capped.ctx as never, {
+      query: "x", limit: 5, budget: 100, fill: true,
+    });
+    expect(result).toEqual({ page: [hit("a", 9)], cursor: "c2", isDone: false });
+    expect(capped.calls.map((c) => [c.limit, c.budget])).toEqual([[5, 100], [5, 40]]);
+  });
+
+  test("searchDocs refills the hits whose document is gone", async () => {
+    const index = new SearchIndex(component, { name: "notes" });
+    const rows = {
+      n1: { _id: "n1", note: "停車", createdAt: 9 },
+      n3: { _id: "n3", note: "停車場", createdAt: 7 },
+    };
+    const { ctx, calls } = scripted(rows, [
+      { page: [hit("n1", 9), hit("gone", 8)], cursor: "c1", isDone: false, scanned: 2 },
+      { page: [hit("n3", 7)], cursor: "c2", isDone: false, scanned: 1 },
+    ]);
+    const result = await index.searchDocs<Note>(ctx as never, {
+      table: "notes", query: "停車", limit: 2, fill: true,
+    });
+    expect(result.page.map((h) => h.doc._id)).toEqual(["n1", "n3"]);
+    expect(result.cursor).toBe("c2");
+    expect(calls[1]).toMatchObject({ cursor: "c1", limit: 1 });
+  });
+
+  test("without fill, one call and no scanned field in the result", async () => {
+    const index = new SearchIndex(component, { name: "notes" });
+    const { ctx, calls } = scripted({}, [
+      { page: [], cursor: "c1", isDone: false, scanned: 256 },
+    ]);
+    expect(await index.search(ctx as never, { query: "x" })).toEqual({
+      page: [], cursor: "c1", isDone: false,
+    });
+    expect(calls).toHaveLength(1);
+  });
+});
+
 describe("highlight utilities", () => {
   test("locates folded matches across width and case", () => {
     expect(findFoldedRange("停車場月租 ＡＢＣ大樓", "abc")).toEqual([6, 9]);

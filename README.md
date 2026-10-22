@@ -149,6 +149,22 @@ hydration, for keys that are not document ids. `searchPaginated` /
 > arriving. Only `isDone: true` means the search is exhausted. If you render
 > pages incrementally, auto-continue while the page is empty.
 
+To get "up to N matches" in one query without writing that loop, pass
+`fill: true`. The call keeps paging until the page holds `limit` hits, the
+search is done, or 768 candidates have been scanned in total (`budget`
+lowers that cap). `searchDocs` counts a hit whose document is gone as a
+miss and keeps going. The cursor contract is unchanged, so a filled page
+can still come back short with a non-null cursor:
+
+```ts
+const { page } = await notesSearch.searchDocs<Doc<"notes">>(ctx, {
+  table: "notes",
+  query: args.query,
+  limit: 20,
+  fill: true,
+});
+```
+
 ### Highlighting
 
 The same folding the index uses, mapped back to original offsets — so a
@@ -283,6 +299,10 @@ fraction of the cost; paging naturally continues into older shards
   runs, leftover postings are only rejected candidates — never wrong
   results. (Convex counts deletes as reads, 4096/transaction, so a max-size
   entry cannot be unindexed synchronously.)
+- **Writes**: `set` compares the new entry with the stored one first. When
+  the folded text and `sortKey` are unchanged it skips the posting diff, so
+  re-syncing an unchanged document or changing only its filters costs one
+  row read and at most one row write.
 - **Ordering**: `sortKey` descending only. Changing an entry's `sortKey`
   rewrites all its posting rows synchronously; a change touching more than
   3000 surviving grams is refused. Prefer stable sort keys (creation time).

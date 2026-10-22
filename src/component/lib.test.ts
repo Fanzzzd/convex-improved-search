@@ -344,6 +344,54 @@ describe("updates and removal", () => {
 		expect(await searchAll(t, "同文")).toEqual(["a", "b"]);
 	});
 
+	test("a filter-only or no-op re-set leaves the postings alone", async () => {
+		const t = initConvexTest();
+		await seed(t, [{ key: "a", fields: asFields("過磅單"), sortKey: 1, filters: { site: "x" } }]);
+		const postingRows = () =>
+			t.run(async (ctx) =>
+				(await ctx.db.query("postings").collect()).map((p) => `${p._id}:${p.sortKey}`).sort(),
+			);
+		const before = await postingRows();
+		await t.mutation(api.lib.set, {
+			namespace: NS, key: "a", fields: asFields("過磅單"), sortKey: 1, filters: { site: "y" },
+		});
+		expect(await searchAll(t, "過磅", { filters: { site: "x" } })).toEqual([]);
+		expect(await searchAll(t, "過磅", { filters: { site: "y" } })).toEqual(["a"]);
+		await t.mutation(api.lib.set, {
+			namespace: NS, key: "a", fields: asFields("過磅單"), sortKey: 1, filters: { site: "y" },
+		});
+		await t.mutation(api.lib.set, { namespace: NS, key: "a", fields: asFields("過磅單"), sortKey: 1 });
+		expect(await searchAll(t, "過磅", { filters: { site: "y" } })).toEqual([]);
+		expect(await searchAll(t, "過磅")).toEqual(["a"]);
+		expect(await postingRows()).toEqual(before);
+	});
+
+	test("an unchanged re-set does not read the postings (a missing row stays missing)", async () => {
+		const t = initConvexTest();
+		await seed(t, [{ key: "a", fields: asFields("過磅單"), sortKey: 1 }]);
+		const countPostings = () => t.run(async (ctx) => (await ctx.db.query("postings").collect()).length);
+		const full = await countPostings();
+		await t.run(async (ctx) => {
+			const row = await ctx.db.query("postings").first();
+			if (row !== null) await ctx.db.delete("postings", row._id);
+		});
+		await t.mutation(api.lib.set, { namespace: NS, key: "a", fields: asFields("過磅單"), sortKey: 1, filters: { site: "x" } });
+		expect(await countPostings()).toBe(full - 1);
+		// A text change runs the full diff again and repairs the gap.
+		await t.mutation(api.lib.set, { namespace: NS, key: "a", fields: asFields("過磅單!"), sortKey: 1 });
+		expect(await countPostings()).toBe(full + 1);
+	});
+
+	test("renaming a field with the same text is not a no-op", async () => {
+		const t = initConvexTest();
+		await seed(t, [{ key: "a", fields: [{ name: "title", value: "停車" }], sortKey: 1 }]);
+		await t.mutation(api.lib.set, {
+			namespace: NS, key: "a", fields: [{ name: "body", value: "停車" }], sortKey: 1,
+		});
+		const result = await t.query(api.lib.search, { namespace: NS, query: "停車" });
+		expect(result.page).toEqual([{ key: "a", sortKey: 1, matchedFields: ["body"] }]);
+	});
+
 	test("remove drops the document", async () => {
 		const t = initConvexTest();
 		await seed(t, [
