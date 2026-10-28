@@ -205,6 +205,28 @@ describe("fields", () => {
 		expect(hit.page.map((row) => row.matchedFields)).toEqual([["cargo"]]);
 	});
 
+	test("fields restricts which Fields can match and which are reported", async () => {
+		const t = initConvexTest();
+		await seed(t, [
+			{ key: "own", fields: [{ name: "no", value: "TR-1" }, { name: "memo", value: "停車" }], sortKey: 3 },
+			{ key: "cites", fields: [{ name: "no", value: "TR-2" }, { name: "memo", value: "原單 TR-1" }], sortKey: 2 },
+			{ key: "both", fields: [{ name: "no", value: "TR-1" }, { name: "memo", value: "TR-1 補" }], sortKey: 1 },
+		]);
+		const only = async (fields: string[]) =>
+			(await t.query(api.lib.search, { namespace: NS, query: "tr-1", fields })).page.map(
+				(row) => [row.key, [...row.matchedFields].sort()],
+			);
+		expect(await only(["no"])).toEqual([["own", ["no"]], ["both", ["no"]]]);
+		expect(await only(["memo"])).toEqual([["cites", ["memo"]], ["both", ["memo"]]]);
+		expect(await only(["no", "memo", "absent"])).toEqual([
+			["own", ["no"]],
+			["cites", ["memo"]],
+			["both", ["memo", "no"]],
+		]);
+		const none = await t.query(api.lib.search, { namespace: NS, query: "tr-1", fields: [] });
+		expect(none).toEqual({ page: [], cursor: null, isDone: true, scanned: 0 });
+	});
+
 	test("duplicate field names are refused", async () => {
 		const t = initConvexTest();
 		await expect(

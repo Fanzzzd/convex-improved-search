@@ -1,6 +1,7 @@
-import { ConvexError, v } from "convex/values";
+import { ConvexError, compareValues, v } from "convex/values";
 import { internalMutation, mutation, query } from "./_generated/server.js";
 import type { QueryCtx } from "./_generated/server.js";
+import type { Doc } from "./_generated/dataModel.js";
 import { internal } from "./_generated/api.js";
 import { filtersValidator, foldedFieldsValidator } from "./schema.js";
 import {
@@ -11,24 +12,6 @@ import {
 	queryGrams,
 	truncateCodepoints,
 } from "./grams.js";
-
-/**
- * How many candidate postings one `search` call may scan. Every scanned
- * candidate costs up to 4 index ranges (3 membership checks + 1 doc read) and
- * Convex allows 4096 index ranges per transaction, so the ceiling leaves
- * room for the caller's own reads. When the budget runs out before the page
- * fills, the returned cursor points at the last *scanned* row — callers keep
- * paging and matches keep arriving; nothing is silently skipped.
- */
-const DEFAULT_SCAN_BUDGET = 256;
-const MAX_SCAN_BUDGET = 768;
-const DEFAULT_LIMIT = 50;
-const MAX_LIMIT = 200;
-
-/** How many grams of the query to probe for selectivity, and to verify per candidate. */
-const PROBE_GRAMS = 8;
-const PROBE_ROWS = 17;
-const CHECK_GRAMS = 3;
 
 /**
  * Convex counts every delete/patch as a read toward its 4096-reads-per-
@@ -46,6 +29,46 @@ const SYNC_DELETE_BUDGET = 800;
 const SYNC_PATCH_LIMIT = 3000;
 const REAP_BATCH = 3000;
 
+/**
+ * The Scan Budget: how many candidates one `search` call may verify. A
+ * candidate reaches Verification only after it holds every check gram, and
+ * Verification costs one index range (the doc read). Convex allows 4096
+ * index ranges per transaction, shared with the caller and with every other
+ * `search` call in it, so each call also caps itself at what the transaction
+ * has left (see transactionHeadroom). When the budget runs out before the
+ * page fills, the returned cursor covers only what was examined — callers
+ * keep paging and matches keep arriving; nothing is silently skipped.
+ */
+const DEFAULT_SCAN_BUDGET = 256;
+const MAX_SCAN_BUDGET = 768;
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 200;
+
+/**
+ * Gram selection. A probe reads the first PROBE_ROWS postings of one query
+ * gram after the cursor. The sparsest gram becomes the candidate stream and
+ * the next CHECK_GRAMS sparsest are merge-joined against it. Queries with
+ * more distinct grams than MAX_PROBE_GRAMS probe an evenly spaced subset.
+ */
+const MAX_PROBE_GRAMS = 16;
+const PROBE_ROWS = 32;
+const CHECK_GRAMS = 3;
+
+/**
+ * Rows one call may stream after probing (candidate and check streams, doc
+ * reads included): ROWS_PER_CANDIDATE per budgeted candidate, between
+ * MIN_STREAM_ROWS and MAX_STREAM_ROWS. Convex allows 32000 rows read per
+ * transaction.
+ */
+const ROWS_PER_CANDIDATE = 16;
+/** Rows a check stream walks toward a candidate before reopening at it (one range ≈ 8 rows of the per-transaction limits). */
+const LEAP_ROWS = 8;
+const MIN_STREAM_ROWS = 64;
+const MAX_STREAM_ROWS = 4096;
+/** Transaction headroom every call leaves for the caller (hydration, its own reads). */
+const RESERVED_RANGES = 512;
+const RESERVED_ROWS = 4096;
+
 const searchResultValidator = v.object({
 	page: v.array(
 		v.object({
@@ -58,11 +81,13 @@ const searchResultValidator = v.object({
 	/** Pass back to continue. Non-null with an unfilled page means "budget spent, keep paging". */
 	cursor: v.union(v.string(), v.null()),
 	isDone: v.boolean(),
-	/** Distinct candidates examined this call (≤ budget); lets callers cap a multi-call fill. */
+	/** Candidates verified this call (≤ budget); lets callers cap a multi-call fill. */
 	scanned: v.number(),
 });
 
 type Cursor = { s: number; k: string };
+type Posting = Doc<"postings">;
+type Position = { sortKey: number; key: string };
 
 function encodeCursor(cursor: Cursor): string {
 	return JSON.stringify(cursor);
@@ -110,10 +135,185 @@ function assertFiniteFilters(filters: Record<string, string | number | boolean |
 	}
 }
 
+/** Index order of (sortKey, key): Convex's own comparison, UTF-8 order for strings. */
+function comparePositions(a: Position, b: Position): number {
+	return compareValues(a.sortKey, b.sortKey) || compareValues(a.key, b.key);
+}
+
 /** DESC-order "strictly after the cursor": rows the previous page already covered. */
-function coveredByCursor(cursor: Cursor | null, sortKey: number, key: string): boolean {
+function coveredByCursor(cursor: Cursor | null, position: Position): boolean {
 	if (cursor === null) return false;
-	return sortKey > cursor.s || (sortKey === cursor.s && key >= cursor.k);
+	return comparePositions(position, { sortKey: cursor.s, key: cursor.k }) >= 0;
+}
+
+function cursorAt(position: Position): Cursor {
+	return { s: position.sortKey, k: position.key };
+}
+
+/** Covers every position before `position` in the DESC stream, but not `position` itself. */
+function cursorBefore(position: Position): Cursor {
+	// key + "\u0000" is the least key greater than key.
+	return { s: position.sortKey, k: position.key + "\u0000" };
+}
+
+/**
+ * What the rest of the transaction can still afford. Convex counts the
+ * caller's reads and every earlier `search` in the same transaction toward
+ * one 4096-range / 32000-row limit, so a fixed per-call budget lets a
+ * caller that loops over `search` overrun it. Without
+ * getTransactionMetrics (older backends) only the static caps apply.
+ */
+async function transactionHeadroom(
+	ctx: QueryCtx,
+): Promise<{ ranges: number; rows: number }> {
+	try {
+		const metrics = await ctx.meta.getTransactionMetrics();
+		return {
+			ranges: metrics.databaseQueries.remaining - RESERVED_RANGES,
+			rows: metrics.documentsRead.remaining - RESERVED_ROWS,
+		};
+	} catch {
+		return { ranges: Infinity, rows: Infinity };
+	}
+}
+
+function gramStream(
+	ctx: { db: QueryCtx["db"] },
+	namespace: string,
+	gram: string,
+	sortKeyAtMost: number | null,
+) {
+	return ctx.db
+		.query("postings")
+		.withIndex("by_ns_gram", (q) => {
+			const base = q.eq("namespace", namespace).eq("gram", gram);
+			return sortKeyAtMost === null ? base : base.lte("sortKey", sortKeyAtMost);
+		})
+		.order("desc");
+}
+
+/** At most `max` items, evenly spaced, first and last included. */
+function spread<T>(items: T[], max: number): T[] {
+	if (items.length <= max) return items;
+	return Array.from(
+		{ length: max },
+		(_, i) => items[Math.round((i * (items.length - 1)) / (max - 1))],
+	);
+}
+
+/**
+ * Probe the query's grams after the cursor, sparsest first. A probe that
+ * comes back short is an exact count and sparser than any full one. Of two
+ * full probes, the one whose last row lies further back is spread thinner
+ * over the same order. Ties keep query order.
+ */
+async function probeGrams(
+	ctx: { db: QueryCtx["db"] },
+	namespace: string,
+	grams: string[],
+	cursor: Cursor | null,
+): Promise<{ gram: string; rows: number }[]> {
+	const probed = await Promise.all(
+		spread(grams, MAX_PROBE_GRAMS).map(async (gram) => {
+			const rows = await gramStream(ctx, namespace, gram, cursor?.s ?? null).take(PROBE_ROWS);
+			return { gram, rows: rows.length, last: rows.at(-1) ?? null };
+		}),
+	);
+	return probed.sort((a, b) => {
+		if (a.rows < PROBE_ROWS || b.rows < PROBE_ROWS) return a.rows - b.rows;
+		return a.last === null || b.last === null ? 0 : comparePositions(a.last, b.last);
+	});
+}
+
+/** What one call may still spend: streamed rows and index ranges. */
+class CallBudget {
+	constructor(
+		private rows: number,
+		private ranges: number,
+	) {}
+	takeRow(): boolean {
+		if (this.rows <= 0) return false;
+		this.rows -= 1;
+		return true;
+	}
+	takeRange(): boolean {
+		if (this.ranges <= 0) return false;
+		this.ranges -= 1;
+		return true;
+	}
+}
+
+/**
+ * One check gram's postings, walked in step with the candidate stream. Both
+ * run DESC in the same (sortKey, key) order, so "does candidate P hold this
+ * gram" is answered by advancing to P: a few streamed rows instead of one
+ * index range per candidate. When P is more than LEAP_ROWS rows away (the
+ * probe underrated this gram, or P is far down), the stream reopens at P's
+ * sortKey for one range instead. Every live posting of an Entry carries its
+ * current sortKey (set rewrites sortKeys inline), so matching P's exact
+ * position never misses a true match.
+ */
+class CheckStream {
+	private rows: AsyncIterator<Posting> | null = null;
+	private head: Posting | null = null;
+	constructor(
+		readonly gram: string,
+		private readonly open: (sortKeyAtMost: number | null) => AsyncIterator<Posting>,
+		private readonly startAt: number | null,
+	) {}
+
+	/** Whether P holds the gram; null when the call budget ran out before reaching P. */
+	async holds(position: Position, budget: CallBudget): Promise<boolean | null> {
+		let walked = 0;
+		let leapt = false;
+		while (
+			this.rows === null ||
+			(this.head !== null && comparePositions(this.head, position) > 0)
+		) {
+			if (this.rows === null || (walked >= LEAP_ROWS && !leapt)) {
+				if (!budget.takeRange()) return null;
+				const from = this.rows === null ? this.startAt : position.sortKey;
+				leapt = this.rows !== null;
+				this.rows = this.open(from);
+			}
+			if (!budget.takeRow()) return null;
+			const next = await this.rows.next();
+			this.head = next.done ? null : next.value;
+			walked += 1;
+		}
+		return this.head !== null && comparePositions(this.head, position) === 0;
+	}
+}
+
+/**
+ * Whether the candidate holds every check gram; null when the call budget
+ * ran out first. With `mustDecide` the rest is answered by point lookups (one
+ * index range each), so every call gets past its first candidate.
+ */
+async function holdsCheckGrams(
+	ctx: { db: QueryCtx["db"] },
+	namespace: string,
+	posting: Posting,
+	checks: CheckStream[],
+	budget: CallBudget,
+	mustDecide: boolean,
+): Promise<boolean | null> {
+	for (const check of checks) {
+		let holds = await check.holds(posting, budget);
+		if (holds === null) {
+			if (!mustDecide) return null;
+			// `.first()`, not `.unique()`: a pending reap may leave short-lived duplicate rows.
+			holds =
+				(await ctx.db
+					.query("postings")
+					.withIndex("by_ns_key", (q) =>
+						q.eq("namespace", namespace).eq("key", posting.key).eq("gram", check.gram),
+					)
+					.first()) !== null;
+		}
+		if (!holds) return false;
+	}
+	return true;
 }
 
 export const search = query({
@@ -121,6 +321,8 @@ export const search = query({
 		namespace: v.string(),
 		query: v.string(),
 		filters: v.optional(filtersValidator),
+		/** Only these Fields are verified and reported. Default: every Field. */
+		fields: v.optional(v.array(v.string())),
 		cursor: v.optional(v.union(v.string(), v.null())),
 		limit: v.optional(v.number()),
 		budget: v.optional(v.number()),
@@ -130,6 +332,9 @@ export const search = query({
 		const limit = normalizeLimit(args.limit);
 		const budget = normalizeBudget(args.budget, limit);
 		assertFiniteFilters(args.filters);
+		const done = { page: [], cursor: null, isDone: true, scanned: 0 };
+		const fieldNames = args.fields === undefined ? null : new Set(args.fields);
+		if (fieldNames !== null && fieldNames.size === 0) return done;
 		const folded = fold(args.query);
 		// Indexed fields can never exceed this bound, so a longer query is
 		// impossible to satisfy. Count only to the bound before allocating an
@@ -137,111 +342,117 @@ export const search = query({
 		let codepointCount = 0;
 		for (const _codepoint of folded) {
 			codepointCount += 1;
-			if (codepointCount > MAX_TEXT_LENGTH) {
-				return { page: [], cursor: null, isDone: true, scanned: 0 };
-			}
+			if (codepointCount > MAX_TEXT_LENGTH) return done;
 		}
-		if (codepointCount === 0) {
-			return { page: [], cursor: null, isDone: true, scanned: 0 };
-		}
-		const codepoints = Array.from(folded);
+		if (codepointCount === 0) return done;
 		const cursor = decodeCursor(args.cursor);
 		const wantedFilters = Object.entries(args.filters ?? {});
 
 		// Pick the candidate stream. Single codepoint → the g1 index (every
 		// document character starts exactly one gram, so g1 coverage is
-		// complete). Otherwise probe up to PROBE_GRAMS of the query's grams
-		// and stream the scarcest one; a few of the next-scarcest become
-		// point-lookup membership checks that reject most false candidates
-		// before we pay for the doc read. Any gram's stream is a superset of
-		// the true result set, so the probe choice — even a different choice
-		// on the next page — never affects correctness, only cost.
-		let streamField: "gram" | "g1";
-		let streamValue: string;
+		// complete). Otherwise stream the sparsest probed gram and merge-join
+		// the next sparsest against it, so most false candidates die before
+		// the doc read. Any gram's stream is a superset of the true result
+		// set, so the probe choice — even a different choice on the next
+		// page — never affects correctness, only cost.
+		let stream: AsyncIterable<Posting>;
 		let checkGrams: string[] = [];
-		if (codepoints.length === 1) {
-			streamField = "g1";
-			streamValue = folded;
+		if (codepointCount === 1) {
+			stream = ctx.db
+				.query("postings")
+				.withIndex("by_ns_g1", (q) => {
+					const base = q.eq("namespace", args.namespace).eq("g1", folded);
+					return cursor === null ? base : base.lte("sortKey", cursor.s);
+				})
+				.order("desc");
 		} else {
-			const grams = queryGrams(folded);
-			const probed = await Promise.all(
-				grams.slice(0, PROBE_GRAMS).map(async (gram) => {
-					const rows = await ctx.db
-						.query("postings")
-						.withIndex("by_ns_gram", (q) =>
-							q.eq("namespace", args.namespace).eq("gram", gram),
-						)
-						.take(PROBE_ROWS);
-					return { gram, count: rows.length };
-				}),
-			);
-			probed.sort((a, b) => a.count - b.count);
-			streamField = "gram";
-			streamValue = probed[0].gram;
+			const probed = await probeGrams(ctx, args.namespace, queryGrams(folded), cursor);
+			// Every match holds every query gram, so an empty gram ends the search.
+			if (probed[0].rows === 0) return done;
+			stream = gramStream(ctx, args.namespace, probed[0].gram, cursor?.s ?? null);
 			checkGrams = probed.slice(1, 1 + CHECK_GRAMS).map((p) => p.gram);
 		}
-
-		const stream =
-			streamField === "gram"
-				? ctx.db
-						.query("postings")
-						.withIndex("by_ns_gram", (q) => {
-							const base = q.eq("namespace", args.namespace).eq("gram", streamValue);
-							return cursor === null ? base : base.lte("sortKey", cursor.s);
-						})
-						.order("desc")
-				: ctx.db
-						.query("postings")
-						.withIndex("by_ns_g1", (q) => {
-							const base = q.eq("namespace", args.namespace).eq("g1", streamValue);
-							return cursor === null ? base : base.lte("sortKey", cursor.s);
-						})
-						.order("desc");
+		const checks = checkGrams.map(
+			(gram) =>
+				new CheckStream(
+					gram,
+					(sortKeyAtMost) =>
+						gramStream(ctx, args.namespace, gram, sortKeyAtMost)[Symbol.asyncIterator](),
+					cursor?.s ?? null,
+				),
+		);
+		const headroom = await transactionHeadroom(ctx);
+		// Ranges left after the candidate stream: check stream opens and
+		// leaps, and one doc read per verified candidate.
+		const callBudget = new CallBudget(
+			Math.max(
+				MIN_STREAM_ROWS,
+				Math.min(budget * ROWS_PER_CANDIDATE, MAX_STREAM_ROWS, headroom.rows),
+			),
+			Math.min(budget * (1 + checks.length), headroom.ranges - 1),
+		);
 
 		const page: { key: string; sortKey: number; matchedFields: string[] }[] = [];
-		let scanned = 0;
-		let streamed = 0;
+		let verified = 0;
 		let last: Cursor | null = null;
 		let exhausted = true;
-		const seen = new Set<string>();
 		for await (const posting of stream) {
 			if (!Number.isFinite(posting.sortKey)) {
 				throw new ConvexError(
 					`Indexed document "${posting.key}" has a non-finite sortKey; re-set or remove it`,
 				);
 			}
-			if (coveredByCursor(cursor, posting.sortKey, posting.key)) continue;
-			// Skipped duplicates cost a streamed row but no reads, so they get
-			// their own (generous) cap instead of the scan budget. Checked
-			// before `last` moves: the cursor must never cover an unhandled row.
-			streamed += 1;
-			if (streamed > budget * 8) {
+			if (coveredByCursor(cursor, posting)) continue;
+			// Checked before `last` moves: the cursor must never cover an unhandled row.
+			if (!callBudget.takeRow()) {
 				exhausted = false;
 				break;
 			}
-			last = { s: posting.sortKey, k: posting.key };
-			// One document can own many posting rows in this stream (all its
-			// g1 grams; briefly, duplicate rows while a reap is pending).
-			if (seen.has(posting.key)) continue;
-			seen.add(posting.key);
-			scanned += 1;
-
-			const matches = await candidateMatches(
+			// One document can own several adjacent rows at one position in
+			// this stream (all its g1 grams; briefly, duplicates while a reap
+			// is pending).
+			if (last !== null && comparePositions(posting, { sortKey: last.s, key: last.k }) === 0) {
+				continue;
+			}
+			const nominated = await holdsCheckGrams(
 				ctx,
 				args.namespace,
-				posting.key,
-				checkGrams,
+				posting,
+				checks,
+				callBudget,
+				last === null,
+			);
+			if (nominated === null) {
+				last = cursorBefore(posting);
+				exhausted = false;
+				break;
+			}
+			if (nominated && !callBudget.takeRange() && last !== null) {
+				last = cursorBefore(posting);
+				exhausted = false;
+				break;
+			}
+			last = cursorAt(posting);
+			if (!nominated) continue;
+
+			verified += 1;
+			callBudget.takeRow();
+			const matchedFields = await verifyCandidate(
+				ctx,
+				args.namespace,
+				posting,
 				wantedFilters,
 				folded,
+				fieldNames,
 			);
-			if (matches !== null) {
-				page.push({ key: posting.key, ...matches });
+			if (matchedFields !== null) {
+				page.push({ key: posting.key, sortKey: posting.sortKey, matchedFields });
 				if (page.length >= limit) {
 					exhausted = false;
 					break;
 				}
 			}
-			if (scanned >= budget) {
+			if (verified >= budget) {
 				exhausted = false;
 				break;
 			}
@@ -251,47 +462,40 @@ export const search = query({
 			page,
 			cursor: exhausted || last === null ? null : encodeCursor(last),
 			isDone: exhausted,
-			scanned,
+			scanned: verified,
 		};
 	},
 });
 
-/** Returns the doc's sortKey + matched field names when the candidate truly matches, else null. */
-async function candidateMatches(
+/** The candidate's matched field names when it truly matches, else null. */
+async function verifyCandidate(
 	ctx: { db: QueryCtx["db"] },
 	namespace: string,
-	key: string,
-	checkGrams: string[],
+	posting: Posting,
 	wantedFilters: [string, string | number | boolean | null][],
 	foldedQuery: string,
-): Promise<{ sortKey: number; matchedFields: string[] } | null> {
-	// Cheap rejections first: gram membership point-reads. `.first()`, not
-	// `.unique()`: a pending reap may leave short-lived duplicate rows.
-	for (const gram of checkGrams) {
-		const hit = await ctx.db
-			.query("postings")
-			.withIndex("by_ns_key", (q) =>
-				q.eq("namespace", namespace).eq("key", key).eq("gram", gram),
-			)
-			.first();
-		if (hit === null) return null;
-	}
-	// …then the doc read, filters, and the exact per-field verification that
-	// makes the index a pure candidate filter: correctness never rests on the
+	fieldNames: Set<string> | null,
+): Promise<string[] | null> {
+	// The doc read, filters, and the exact per-field verification that makes
+	// the index a pure candidate filter: correctness never rests on the
 	// grams, and matched field names fall out for free.
 	const doc = await ctx.db
 		.query("docs")
-		.withIndex("by_ns_key", (q) => q.eq("namespace", namespace).eq("key", key))
+		.withIndex("by_ns_key", (q) => q.eq("namespace", namespace).eq("key", posting.key))
 		.unique();
-	if (doc === null) return null;
+	// A posting whose sortKey disagrees with the doc is stale (its reap is
+	// pending); the live posting at doc.sortKey nominates the Entry instead.
+	if (doc === null || doc.sortKey !== posting.sortKey) return null;
 	for (const [field, value] of wantedFilters) {
 		if (doc.filters?.[field] !== value) return null;
 	}
 	const matchedFields = Object.entries(doc.fields)
-		.filter(([, folded]) => folded.includes(foldedQuery))
+		.filter(
+			([name, folded]) =>
+				(fieldNames === null || fieldNames.has(name)) && folded.includes(foldedQuery),
+		)
 		.map(([name]) => name);
-	if (matchedFields.length === 0) return null;
-	return { sortKey: doc.sortKey, matchedFields };
+	return matchedFields.length === 0 ? null : matchedFields;
 }
 
 export const set = mutation({

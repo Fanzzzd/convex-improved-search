@@ -18,9 +18,10 @@ const DEFAULT_SCAN_BUDGET = 256;
 const MAX_LIMIT = 200;
 const MAX_SCAN_BUDGET = 768;
 /**
- * `fill` bounds: total candidates scanned across all calls (each costs up to
- * 4 index ranges, so ~3072 of the 4096 per transaction) and calls per fill.
- * The call cap bounds rows streamed past duplicates, which `scanned` omits.
+ * `fill` bounds: total candidates verified across all calls (one index range
+ * each) and calls per fill. The call cap bounds the rows streamed past
+ * rejected candidates, which `scanned` omits. Each component call also caps
+ * itself at what the transaction has left.
  */
 const FILL_SCAN_BUDGET = MAX_SCAN_BUDGET;
 const MAX_FILL_CALLS = 4;
@@ -84,11 +85,22 @@ export type IndexEntry<Filter extends string = never> = {
 export type SearchArgs<Filter extends string = never> = {
   query: string;
   filters?: Partial<Record<Filter, FilterValue>>;
+  /**
+   * Match only these fields: hits whose query occurrence lies in other
+   * fields are dropped inside the component, and `matchedFields` lists only
+   * these. Use this instead of filtering `matchedFields` afterwards, so
+   * `fill` and the scan budget count what you keep. `[]` matches nothing.
+   */
+  fields?: readonly string[];
   cursor?: string | null;
   limit?: number;
   /**
-   * Max candidate postings scanned this call. Raise for very selective
-   * filters. Under `fill`, the cap across all calls (default and maximum 768).
+   * Max candidates verified this call (each costs one index range). Raise for
+   * very selective filters. Under `fill`, the cap across all calls (default
+   * and maximum 768). Every call shares the transaction's 4096 index ranges
+   * with your own reads and with every other `search` in the same query, so
+   * the component also stops early when the transaction runs low: the page
+   * comes back short with a cursor, as when the budget runs out.
    */
   budget?: number;
   /**
@@ -236,6 +248,7 @@ export class SearchIndex<Filter extends string = never> {
       namespace: this.options.name,
       query: args.query,
       filters: compactFilters(args.filters),
+      fields: args.fields === undefined ? undefined : [...args.fields],
       cursor: args.cursor,
       limit: args.limit,
       budget: args.budget,

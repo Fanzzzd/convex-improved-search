@@ -149,6 +149,16 @@ hydration, for keys that are not document ids. `searchPaginated` /
 > arriving. Only `isDone: true` means the search is exhausted. If you render
 > pages incrementally, auto-continue while the page is empty.
 
+To search only some fields, pass `fields`. Hits whose query occurrence
+lies only in other fields are dropped inside the component, and
+`matchedFields` lists only the named fields. Prefer it over filtering
+`matchedFields` yourself: the scan budget and `fill` then count only the
+hits you keep.
+
+```ts
+await reimbursementsSearch.search(ctx, { query: "TR-260720-006", fields: ["no"] });
+```
+
 To get "up to N matches" in one query without writing that loop, pass
 `fill: true`. The call keeps paging until the page holds `limit` hits, the
 search is done, or 768 candidates have been scanned in total (`budget`
@@ -308,6 +318,20 @@ fraction of the cost; paging naturally continues into older shards
   3000 surviving grams is refused. Prefer stable sort keys (creation time).
 - **Filters**: exact-match only, post-filtering. Highly selective filters
   over very common substrings consume scan budget — raise `budget` if needed.
+- **Read cost**: one `search` call probes up to 16 of the query's grams,
+  streams the sparsest, and merge-joins the next three against it, so a
+  rejected candidate costs streamed rows, not index ranges. Each verified
+  candidate costs one index range (`budget` caps them, default 256, max
+  768). Every call in one transaction shares Convex's limits (4096 index
+  ranges, 32000 rows, and 15 s of total database time) with your own reads
+  and with every other `search` in it. Each call checks what the
+  transaction has left, keeps 512 ranges for you, and otherwise returns a
+  short page with a cursor. Calling `search` in a loop inside one query
+  therefore adds up; use `fill: true` and `fields` instead, and page
+  further from the client.
+- **Exact identifiers**: to look up a whole document number, an equality
+  index on your own table answers in one index range. Substring search is
+  for partial numbers and free text.
 - **Scale**: designed for up to ~100k documents per namespace. Storage is
   roughly one small row per character of indexed text. Beyond that,
   partition by time with `ShardedSearchIndex` (see above).

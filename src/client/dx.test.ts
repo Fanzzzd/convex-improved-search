@@ -307,6 +307,16 @@ describe("fill", () => {
     expect(capped.calls.map((c) => [c.limit, c.budget])).toEqual([[5, 100], [5, 40]]);
   });
 
+  test("passes fields to every call of a fill", async () => {
+    const index = new SearchIndex(component, { name: "notes" });
+    const { ctx, calls } = scripted({}, [
+      { page: [], cursor: "c1", isDone: false, scanned: 30 },
+      { page: [hit("a", 9)], cursor: null, isDone: true, scanned: 5 },
+    ]);
+    await index.search(ctx as never, { query: "x", fields: ["note"], fill: true });
+    expect(calls.map((c) => c.fields)).toEqual([["note"], ["note"]]);
+  });
+
   test("searchDocs refills the hits whose document is gone", async () => {
     const index = new SearchIndex(component, { name: "notes" });
     const rows = {

@@ -65,8 +65,16 @@ Verification. An absent field matches nothing; `null` is a real value.
 _Avoid_: facet, tag
 
 **Scan Budget**:
-The maximum number of candidates one `search` call may examine. Exhausting
-it ends the call, never the search.
+The maximum number of candidates one `search` call may verify (one index
+range each). A call also stops early when its transaction runs low, since
+every call in a transaction shares one set of limits. Exhausting either
+ends the call, never the search.
+
+**Check Gram**:
+A query Gram streamed alongside the candidate stream and merge-joined
+against it, so a candidate missing the Gram is rejected without a read of
+its own. Chosen by probing: the sparsest Gram is the candidate stream, the
+next sparsest are Check Grams.
 
 **Page**:
 The result of one `search` call: matched keys plus a Cursor. A Page may be

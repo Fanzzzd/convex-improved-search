@@ -55,6 +55,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           budget?: number;
           cursor?: string | null;
+          fields?: Array<string>;
           filters?: Record<string, string | number | boolean | null>;
           limit?: number;
           namespace: string;
