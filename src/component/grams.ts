@@ -75,16 +75,25 @@ export function queryGrams(foldedQuery: string): string[] {
 	return [...grams];
 }
 
-/** First codepoint of a gram (codepoint-safe: never half a surrogate pair). */
 /** Union of documentGrams over each field's folded text — grams never span field boundaries. */
 export function documentGramsOfFields(fields: Record<string, string>): Set<string> {
-	const grams = new Set<string>();
-	for (const value of Object.values(fields)) {
-		for (const gram of documentGrams(value)) grams.add(gram);
-	}
-	return grams;
+	return new Set(gramFieldsOf(fields).keys());
 }
 
+/** Each gram of the entry with the names of the Fields that contain it, sorted: a posting's `fields` tag. */
+export function gramFieldsOf(fields: Record<string, string>): Map<string, string[]> {
+	const tags = new Map<string, string[]>();
+	for (const name of Object.keys(fields).sort()) {
+		for (const gram of documentGrams(fields[name])) {
+			const tag = tags.get(gram);
+			if (tag === undefined) tags.set(gram, [name]);
+			else tag.push(name);
+		}
+	}
+	return tags;
+}
+
+/** First codepoint of a gram (codepoint-safe: never half a surrogate pair). */
 export function firstCodepoint(gram: string): string {
 	const first = gram.codePointAt(0);
 	// Grams are never empty; guard for type narrowing only.

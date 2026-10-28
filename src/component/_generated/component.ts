@@ -66,6 +66,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           isDone: boolean;
           page: Array<{ key: string; matchedFields: Array<string>; sortKey: number }>;
           scanned: number;
+          verified: number;
         },
         Name
       >;

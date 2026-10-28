@@ -248,7 +248,7 @@ describe("searchDocs / searchPaginated", () => {
 
 describe("fill", () => {
   type Hit = { key: string; sortKey: number; matchedFields: string[] };
-  type Page = { page: Hit[]; cursor: string | null; isDone: boolean; scanned: number };
+  type Page = { page: Hit[]; cursor: string | null; isDone: boolean; verified: number };
   const hit = (key: string, sortKey: number): Hit => ({ key, sortKey, matchedFields: ["note"] });
 
   /** runQuery serves the scripted pages in order and records each call's args. */
@@ -269,9 +269,9 @@ describe("fill", () => {
   test("keeps paging until the page is full, carrying the cursor", async () => {
     const index = new SearchIndex(component, { name: "notes" });
     const { ctx, calls } = scripted({}, [
-      { page: [hit("a", 9)], cursor: "c1", isDone: false, scanned: 100 },
-      { page: [], cursor: "c2", isDone: false, scanned: 200 },
-      { page: [hit("b", 5), hit("c", 4)], cursor: "c3", isDone: false, scanned: 50 },
+      { page: [hit("a", 9)], cursor: "c1", isDone: false, verified: 100 },
+      { page: [], cursor: "c2", isDone: false, verified: 200 },
+      { page: [hit("b", 5), hit("c", 4)], cursor: "c3", isDone: false, verified: 50 },
     ]);
     const result = await index.search(ctx as never, { query: "x", limit: 3, fill: true });
     expect(result).toEqual({
@@ -289,16 +289,16 @@ describe("fill", () => {
   test("stops when the index is done or the scan cap is spent", async () => {
     const index = new SearchIndex(component, { name: "notes" });
     const done = scripted({}, [
-      { page: [hit("a", 9)], cursor: "c1", isDone: false, scanned: 10 },
-      { page: [], cursor: null, isDone: true, scanned: 3 },
+      { page: [hit("a", 9)], cursor: "c1", isDone: false, verified: 10 },
+      { page: [], cursor: null, isDone: true, verified: 3 },
     ]);
     expect(
       await index.search(done.ctx as never, { query: "x", limit: 5, fill: true }),
     ).toEqual({ page: [hit("a", 9)], cursor: null, isDone: true });
 
     const capped = scripted({}, [
-      { page: [], cursor: "c1", isDone: false, scanned: 60 },
-      { page: [hit("a", 9)], cursor: "c2", isDone: false, scanned: 40 },
+      { page: [], cursor: "c1", isDone: false, verified: 60 },
+      { page: [hit("a", 9)], cursor: "c2", isDone: false, verified: 40 },
     ]);
     const result = await index.search(capped.ctx as never, {
       query: "x", limit: 5, budget: 100, fill: true,
@@ -310,8 +310,8 @@ describe("fill", () => {
   test("passes fields to every call of a fill", async () => {
     const index = new SearchIndex(component, { name: "notes" });
     const { ctx, calls } = scripted({}, [
-      { page: [], cursor: "c1", isDone: false, scanned: 30 },
-      { page: [hit("a", 9)], cursor: null, isDone: true, scanned: 5 },
+      { page: [], cursor: "c1", isDone: false, verified: 30 },
+      { page: [hit("a", 9)], cursor: null, isDone: true, verified: 5 },
     ]);
     await index.search(ctx as never, { query: "x", fields: ["note"], fill: true });
     expect(calls.map((c) => c.fields)).toEqual([["note"], ["note"]]);
@@ -324,8 +324,8 @@ describe("fill", () => {
       n3: { _id: "n3", note: "停車場", createdAt: 7 },
     };
     const { ctx, calls } = scripted(rows, [
-      { page: [hit("n1", 9), hit("gone", 8)], cursor: "c1", isDone: false, scanned: 2 },
-      { page: [hit("n3", 7)], cursor: "c2", isDone: false, scanned: 1 },
+      { page: [hit("n1", 9), hit("gone", 8)], cursor: "c1", isDone: false, verified: 2 },
+      { page: [hit("n3", 7)], cursor: "c2", isDone: false, verified: 1 },
     ]);
     const result = await index.searchDocs<Note>(ctx as never, {
       table: "notes", query: "停車", limit: 2, fill: true,
@@ -335,10 +335,10 @@ describe("fill", () => {
     expect(calls[1]).toMatchObject({ cursor: "c1", limit: 1 });
   });
 
-  test("without fill, one call and no scanned field in the result", async () => {
+  test("without fill, one call and no verified field in the result", async () => {
     const index = new SearchIndex(component, { name: "notes" });
     const { ctx, calls } = scripted({}, [
-      { page: [], cursor: "c1", isDone: false, scanned: 256 },
+      { page: [], cursor: "c1", isDone: false, verified: 256 },
     ]);
     expect(await index.search(ctx as never, { query: "x" })).toEqual({
       page: [], cursor: "c1", isDone: false,

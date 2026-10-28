@@ -19,6 +19,7 @@ function makeCtx(corpus: Record<string, Row[]>) {
 		cursor: string | null | undefined;
 		limit: number | undefined;
 		budget: number | undefined;
+		fields: string[] | undefined;
 	}[] = [];
 	const ctx = {
 		runQuery: async (_ref: unknown, args: Record<string, unknown>) => {
@@ -28,6 +29,7 @@ function makeCtx(corpus: Record<string, Row[]>) {
 				cursor: args.cursor as string | null | undefined,
 				limit: args.limit as number | undefined,
 				budget: args.budget as number | undefined,
+				fields: args.fields as string[] | undefined,
 			});
 			const rows = (corpus[namespace] ?? [])
 				.filter((r) => r.text.includes(args.query as string))
@@ -52,7 +54,13 @@ function makeIndex() {
 async function drain(
 	index: ShardedSearchIndex,
 	ctx: { runQuery: (ref: unknown, args: Record<string, unknown>) => Promise<unknown> },
-	args: { shards: readonly string[]; query: string; limit?: number; budget?: number },
+	args: {
+		shards: readonly string[];
+		query: string;
+		fields?: readonly string[];
+		limit?: number;
+		budget?: number;
+	},
 ) {
 	const keys: string[] = [];
 	let previousSort = Infinity;
@@ -176,6 +184,12 @@ describe("sharded search", () => {
 		expect(first.isDone).toBe(false);
 		expect(calls).toHaveLength(3);
 		expect(calls.every((call) => call.budget === 200)).toBe(true);
+	});
+
+	test("passes fields to every shard", async () => {
+		const { ctx, calls } = makeCtx({});
+		await drain(makeIndex(), ctx, { shards: ["a", "b"], query: "x", fields: ["no"] });
+		expect(calls.map((call) => call.fields)).toEqual([["no"], ["no"]]);
 	});
 
 	test.each([Number.NaN, Number.POSITIVE_INFINITY])(

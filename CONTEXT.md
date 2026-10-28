@@ -45,7 +45,7 @@ every character of an Entry starts exactly one Gram.
 
 **Posting**:
 One stored (Namespace, Gram, Key, Sort Key) fact: "this Entry contains
-this Gram".
+this Gram", tagged with the Fields that hold the Gram.
 
 **Verification**:
 The final per-Field `folded.includes(foldedQuery)` check on every
@@ -74,7 +74,8 @@ ends the call, never the search.
 A query Gram streamed alongside the candidate stream and merge-joined
 against it, so a candidate missing the Gram is rejected without a read of
 its own. Chosen by probing: the sparsest Gram is the candidate stream, the
-next sparsest are Check Grams.
+next sparsest are Check Grams. The Postings' Field tags reject a candidate
+the same way when no wanted Field holds every Gram.
 
 **Page**:
 The result of one `search` call: matched keys plus a Cursor. A Page may be

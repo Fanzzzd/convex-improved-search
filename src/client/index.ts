@@ -6,42 +6,25 @@ import type {
 import type { ComponentApi } from "../component/_generated/component.js";
 
 import { fold } from "../component/grams.js";
+import {
+  MAX_SCAN_BUDGET,
+  normalizeBudget as normalizeSearchBudget,
+  normalizeLimit as normalizeSearchLimit,
+} from "../component/limits.js";
 
 export { MAX_TEXT_LENGTH, fold } from "../component/grams.js";
 
 /** Exact-match filter values. `null` is a real value; an absent field matches nothing. */
 export type FilterValue = string | number | boolean | null;
 
-/** Mirror the component's defaults (used for client-side bookkeeping only). */
-const DEFAULT_LIMIT = 50;
-const DEFAULT_SCAN_BUDGET = 256;
-const MAX_LIMIT = 200;
-const MAX_SCAN_BUDGET = 768;
 /**
  * `fill` bounds: total candidates verified across all calls (one index range
- * each) and calls per fill. The call cap bounds the rows streamed past
- * rejected candidates, which `scanned` omits. Each component call also caps
- * itself at what the transaction has left.
+ * each, the component's `verified`) and calls per fill. The call cap bounds
+ * the rows streamed past rejected candidates, which `verified` omits. Each
+ * component call also caps itself at what the transaction has left.
  */
 const FILL_SCAN_BUDGET = MAX_SCAN_BUDGET;
 const MAX_FILL_CALLS = 4;
-
-function normalizeSearchLimit(raw: number | undefined): number {
-  if (raw !== undefined && !Number.isFinite(raw)) {
-    throw new Error("Search limit must be a finite number");
-  }
-  return Math.max(1, Math.min(Math.floor(raw ?? DEFAULT_LIMIT), MAX_LIMIT));
-}
-
-function normalizeSearchBudget(raw: number | undefined, limit: number): number {
-  if (raw !== undefined && !Number.isFinite(raw)) {
-    throw new Error("Search budget must be a finite number");
-  }
-  return Math.max(
-    limit,
-    Math.min(Math.floor(raw ?? DEFAULT_SCAN_BUDGET), MAX_SCAN_BUDGET),
-  );
-}
 
 export type SearchHit = {
   key: string;
@@ -243,7 +226,7 @@ export class SearchIndex<Filter extends string = never> {
   private async searchOnce(
     ctx: RunQueryCtx,
     args: Omit<SearchArgs<Filter>, "fill">,
-  ): Promise<SearchResultPage & { scanned: number }> {
+  ): Promise<SearchResultPage & { verified: number }> {
     return await ctx.runQuery(this.component.lib.search, {
       namespace: this.options.name,
       query: args.query,
@@ -290,7 +273,7 @@ export class SearchIndex<Filter extends string = never> {
       page.push(...(await hydrate(result.page)));
       cursor = result.cursor;
       isDone = result.isDone;
-      remaining -= result.scanned;
+      remaining -= result.verified;
       if (isDone || cursor === null || page.length >= limit || remaining <= 0) {
         break;
       }
@@ -747,6 +730,7 @@ export class ShardedSearchIndex<Filter extends string = never> {
       const result = await this.shard(args.shards[i]).search(ctx, {
         query: args.query,
         filters: args.filters,
+        fields: args.fields,
         cursor: i === start ? inner : null,
         limit: limit - page.length,
         budget,

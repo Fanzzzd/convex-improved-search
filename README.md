@@ -152,8 +152,9 @@ hydration, for keys that are not document ids. `searchPaginated` /
 To search only some fields, pass `fields`. Hits whose query occurrence
 lies only in other fields are dropped inside the component, and
 `matchedFields` lists only the named fields. Prefer it over filtering
-`matchedFields` yourself: the scan budget and `fill` then count only the
-hits you keep.
+`matchedFields` yourself. Each posting row records which fields hold its
+gram, so the component drops most other-field candidates before reading
+their document. Those candidates cost no index range and no scan budget.
 
 ```ts
 await reimbursementsSearch.search(ctx, { query: "TR-260720-006", fields: ["no"] });
@@ -281,11 +282,14 @@ fraction of the cost; paging naturally continues into older shards
 - Each field's text is folded (`NFKC` + `toLowerCase`) and split into
   overlapping **bigrams of codepoints**, with an end-of-text sentinel per
   field so every character starts exactly one gram and no gram spans a
-  field boundary. One posting row per distinct gram of the entry.
-- A query folds identically. Two-codepoint queries are one index point-lookup;
-  longer queries stream the scarcest gram (chosen by probing) and reject
-  candidates via point-lookups on the others; single-codepoint queries use a
-  first-codepoint index. **Every candidate is then verified per field with
+  field boundary. One posting row per distinct gram of the entry, tagged
+  with the fields that hold the gram.
+- A query folds identically. Two-codepoint queries stream one gram.
+  Longer queries stream the scarcest gram (chosen by probing) and
+  merge-join up to three others against it in index order. A candidate
+  reaches its document read only if it holds those grams and some wanted
+  field holds all of them. Single-codepoint queries use a first-codepoint
+  index. **Every candidate is then verified per field with
   `folded.includes(query)`** — the index is a pure candidate filter, so
   correctness never depends on the gram approximation (the same structural
   argument SQLite's FTS5 trigram tokenizer relies on), and `matchedFields`
@@ -316,19 +320,24 @@ fraction of the cost; paging naturally continues into older shards
 - **Ordering**: `sortKey` descending only. Changing an entry's `sortKey`
   rewrites all its posting rows synchronously; a change touching more than
   3000 surviving grams is refused. Prefer stable sort keys (creation time).
-- **Filters**: exact-match only, post-filtering. Highly selective filters
-  over very common substrings consume scan budget — raise `budget` if needed.
+- **Filters**: exact-match only, checked on the document. Each candidate a
+  filter rejects still costs one index range, so a filter that keeps 1 in
+  100 over a common substring costs about 100 ranges per hit. Postings do
+  not carry filter values: a filter change would then rewrite every
+  posting of the entry. When one filter value selects a small slice you
+  search often (a tenant, an archive flag), give it its own namespace.
 - **Read cost**: one `search` call probes up to 16 of the query's grams,
   streams the sparsest, and merge-joins the next three against it, so a
   rejected candidate costs streamed rows, not index ranges. Each verified
   candidate costs one index range (`budget` caps them, default 256, max
   768). Every call in one transaction shares Convex's limits (4096 index
-  ranges, 32000 rows, and 15 s of total database time) with your own reads
-  and with every other `search` in it. Each call checks what the
-  transaction has left, keeps 512 ranges for you, and otherwise returns a
-  short page with a cursor. Calling `search` in a loop inside one query
-  therefore adds up; use `fill: true` and `fields` instead, and page
-  further from the client.
+  ranges, 32000 rows, 16 MiB read, and 15 s of total database time) with
+  your own reads and with every other `search` in it. Each call checks
+  what the transaction has left, keeps 512 ranges, 4096 rows and 2 MiB for
+  you, and otherwise returns a short page with a cursor. The 15 s limit
+  cannot be measured from inside the query, so the reserve does not cover
+  it. Calling `search` in a loop inside one query therefore adds up; use
+  `fill: true` and `fields` instead, and page further from the client.
 - **Exact identifiers**: to look up a whole document number, an equality
   index on your own table answers in one index range. Substring search is
   for partial numbers and free text.
@@ -340,6 +349,21 @@ fraction of the cost; paging naturally continues into older shards
   If you need that, pre-fold your text (and queries) with a kVariant table
   (e.g. the IRG kVariants data) before calling `set`/`search`; an opt-in
   fold option is on the roadmap.
+
+## Upgrading to 0.5.0
+
+- Posting rows gain an optional `fields` tag. Rows written by earlier
+  versions have none. Search still returns the same results for them; it
+  only cannot drop their other-field candidates early. Re-run your
+  backfill (`syncDoc`/`set`) once to tag them: `set` reads one posting of
+  an unchanged entry, sees the missing tag, and rewrites the tags.
+  Entries you write after the upgrade are tagged as they are written.
+- The component's `search` result gains `verified`: candidates whose
+  document was read, at most `budget`, one index range each. `scanned`
+  still counts distinct candidates examined, but most of them are now
+  rejected by their postings alone, so it can exceed `budget`. A loop that
+  caps its cost should count `verified`. Prefer `fill: true` and `fields`
+  over such loops.
 
 ## Upgrading from 0.1.x
 
@@ -357,7 +381,8 @@ fraction of the cost; paging naturally continues into older shards
 
 ```bash
 npm install
-npm run test        # 81 tests incl. randomized differential suite
+npm run test        # randomized differential suites included
+CIS_BENCH=1 npx vitest run src/component/cost.bench.test.ts  # read-cost benchmark
 npm run typecheck
 npm run lint
 ```

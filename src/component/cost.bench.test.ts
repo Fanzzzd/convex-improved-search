@@ -15,7 +15,10 @@ import { appendFileSync } from "node:fs";
 import { expect, test } from "vitest";
 import { api } from "./_generated/api.js";
 import { initConvexTest } from "./setup.test.js";
-import { documentGramsOfFields, firstCodepoint, fold } from "./grams.js";
+import * as gramsModule from "./grams.js";
+
+const grams = gramsModule as typeof gramsModule & { gramFieldsOf?: typeof gramsModule.gramFieldsOf };
+const { fold } = grams;
 
 type T = ReturnType<typeof initConvexTest>;
 type Entry = {
@@ -78,7 +81,7 @@ function randomText(rand: () => number, max: number): string {
 	return text;
 }
 function hostile(rand: () => number): Entry[] {
-	return Array.from({ length: 2000 }, (_, i) => ({
+	return Array.from({ length: 2000 }, (_, i): Entry => ({
 		key: `h${String(i).padStart(4, "0")}`,
 		fields: rand() < 0.5 ? { text: randomText(rand, 30) } : { a: randomText(rand, 15), b: randomText(rand, 15) },
 		sortKey: Math.floor(rand() * 200),
@@ -120,8 +123,18 @@ async function seed(t: T, entries: Entry[]) {
 				sortKey: entry.sortKey,
 				...(entry.filters === undefined ? {} : { filters: entry.filters }),
 			});
-			for (const gram of documentGramsOfFields(fields)) {
-				await ctx.db.insert("postings", { namespace: NS, key: entry.key, gram, g1: firstCodepoint(gram), sortKey: entry.sortKey });
+			// Builds before 0.5.0 have no posting tags (no gramFieldsOf).
+			const tagged: Map<string, string[] | undefined> =
+				grams.gramFieldsOf?.(fields) ?? new Map([...grams.documentGramsOfFields(fields)].map((gram) => [gram, undefined]));
+			for (const [gram, tag] of tagged) {
+				await ctx.db.insert("postings", {
+					namespace: NS,
+					key: entry.key,
+					gram,
+					g1: grams.firstCodepoint(gram),
+					sortKey: entry.sortKey,
+					...(tag === undefined ? {} : { fields: tag }),
+				} as never);
 			}
 		}
 	});
@@ -214,4 +227,30 @@ test.skipIf(!process.env.CIS_BENCH)("search read-cost benchmark", { timeout: 1_2
 	const filtered = initConvexTest();
 	await seed(filtered, selectiveFilter());
 	report("W6 停車 filter rare drain", await measure(filtered, { query: "停車", filters: { rare: true }, limit: 50 }, 500, false));
+
+	// Added by the round 1 judge.
+	report(
+		"W2' TR-26 memo drained, budget 512",
+		await measure(numbers, { query: "TR-26", fields: ["memo"], budget: 512, limit: 50 }, 500, false),
+	);
+	report(
+		"W7 TR-260720-006 no, 5 calls budget 512 in one transaction",
+		await measure(numbers, { query: "TR-260720-006", fields: ["no"], budget: 512, limit: 50 }, 5, true),
+	);
+	const tied = initConvexTest();
+	await seed(
+		tied,
+		Array.from({ length: 5000 }, (_, i) => ({
+			key: `k${String(i).padStart(5, "0")}`,
+			fields: { text: i % 50 === 0 ? "zabcxz" : `zabcz${i % 7}` },
+			sortKey: 0,
+		})),
+	);
+	report("W8 5000 tied sortKeys abcx drain", await measure(tied, { query: "abcx", limit: 50 }, 2000, false));
+	const negativeZero = initConvexTest();
+	await seed(
+		negativeZero,
+		Array.from({ length: 40 }, (_, i) => ({ key: `n${String(i).padStart(2, "0")}`, fields: { text: "停車費" }, sortKey: -0 })),
+	);
+	report("W9 sortKey -0 停車 drain limit 7", await measure(negativeZero, { query: "停車", limit: 7 }, 30, false));
 });

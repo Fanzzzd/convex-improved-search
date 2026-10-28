@@ -224,7 +224,7 @@ describe("fields", () => {
 			["both", ["memo", "no"]],
 		]);
 		const none = await t.query(api.lib.search, { namespace: NS, query: "tr-1", fields: [] });
-		expect(none).toEqual({ page: [], cursor: null, isDone: true, scanned: 0 });
+		expect(none).toEqual({ page: [], cursor: null, isDone: true, scanned: 0, verified: 0 });
 	});
 
 	test("duplicate field names are refused", async () => {
@@ -388,7 +388,7 @@ describe("updates and removal", () => {
 		expect(await postingRows()).toEqual(before);
 	});
 
-	test("an unchanged re-set does not read the postings (a missing row stays missing)", async () => {
+	test("an unchanged re-set reads one posting, not all (a missing row stays missing)", async () => {
 		const t = initConvexTest();
 		await seed(t, [{ key: "a", fields: asFields("過磅單"), sortKey: 1 }]);
 		const countPostings = () => t.run(async (ctx) => (await ctx.db.query("postings").collect()).length);
@@ -402,6 +402,43 @@ describe("updates and removal", () => {
 		// A text change runs the full diff again and repairs the gap.
 		await t.mutation(api.lib.set, { namespace: NS, key: "a", fields: asFields("過磅單!"), sortKey: 1 });
 		expect(await countPostings()).toBe(full + 1);
+	});
+
+	test("postings carry the Fields that hold their gram; set retags them, and re-setting a pre-0.5.0 entry tags it", async () => {
+		const t = initConvexTest();
+		// Grams end in the U+0001 sentinel, which Convex refuses as an object key.
+		const tags = async () =>
+			Object.fromEntries(
+				await t.run(async (ctx) =>
+					(await ctx.db.query("postings").collect()).map((p) => [
+						p.gram.replace("\u0001", "$"),
+						p.fields?.join(",") ?? "-",
+					]),
+				),
+			);
+		const fields = (no: string, memo: string) => [
+			{ name: "no", value: no },
+			{ name: "memo", value: memo },
+		];
+		await seed(t, [{ key: "a", fields: fields("ab", "bc"), sortKey: 1 }]);
+		expect(await tags()).toEqual({ ab: "no", "b$": "no", bc: "memo", "c$": "memo" });
+		// "ab" now also lies in memo: its row is patched, not rewritten.
+		await t.mutation(api.lib.set, { namespace: NS, key: "a", fields: fields("ab", "abc"), sortKey: 1 });
+		expect((await tags()).ab).toBe("memo,no");
+		expect(
+			(await t.query(api.lib.search, { namespace: NS, query: "ab", fields: ["memo"] })).page,
+		).toEqual([{ key: "a", sortKey: 1, matchedFields: ["memo"] }]);
+		// Rows written before 0.5.0 have no tag; an unchanged re-set (the backfill) adds it.
+		await t.run(async (ctx) => {
+			for (const p of await ctx.db.query("postings").collect()) {
+				await ctx.db.replace("postings", p._id, { namespace: p.namespace, gram: p.gram, g1: p.g1, key: p.key, sortKey: p.sortKey });
+			}
+		});
+		expect(
+			(await t.query(api.lib.search, { namespace: NS, query: "bc", fields: ["memo"] })).page,
+		).toEqual([{ key: "a", sortKey: 1, matchedFields: ["memo"] }]);
+		await t.mutation(api.lib.set, { namespace: NS, key: "a", fields: fields("ab", "abc"), sortKey: 1 });
+		expect((await tags()).ab).toBe("memo,no");
 	});
 
 	test("renaming a field with the same text is not a no-op", async () => {
@@ -552,6 +589,31 @@ describe("deferred reaping", () => {
 				return rows.length;
 			});
 			expect(after).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	}, 60_000);
+
+	test("renaming the Field of a max-size text retags in the reaper; search ignores the stale tags meanwhile", async () => {
+		vi.useFakeTimers();
+		try {
+			const t = initConvexTest();
+			const text = bigText(4096);
+			const middle = Array.from(text).slice(2000, 2005).join("");
+			await t.mutation(api.lib.set, { namespace: NS, key: "big", fields: [{ name: "title", value: text }], sortKey: 1 });
+			// 4096 tag-only patches exceed the inline limit: no throw, a retag mark instead.
+			await t.mutation(api.lib.set, { namespace: NS, key: "big", fields: [{ name: "body", value: text }], sortKey: 1 });
+			const marks = () => t.run(async (ctx) => (await ctx.db.query("retagging").collect()).length);
+			expect(await marks()).toBe(1);
+			const hit = [{ key: "big", sortKey: 1, matchedFields: ["body"] }];
+			expect((await t.query(api.lib.search, { namespace: NS, query: middle, fields: ["body"] })).page).toEqual(hit);
+			await t.finishAllScheduledFunctions(vi.runAllTimers);
+			expect(await marks()).toBe(0);
+			const stale = await t.run(async (ctx) =>
+				(await ctx.db.query("postings").collect()).filter((p) => p.fields?.join() !== "body").length,
+			);
+			expect(stale).toBe(0);
+			expect((await t.query(api.lib.search, { namespace: NS, query: middle, fields: ["body"] })).page).toEqual(hit);
 		} finally {
 			vi.useRealTimers();
 		}

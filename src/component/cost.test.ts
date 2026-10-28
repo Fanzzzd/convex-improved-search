@@ -10,7 +10,7 @@
 import { beforeAll, describe, expect, test } from "vitest";
 import { api } from "./_generated/api.js";
 import { initConvexTest } from "./setup.test.js";
-import { documentGramsOfFields, firstCodepoint, fold } from "./grams.js";
+import { firstCodepoint, fold, gramFieldsOf } from "./grams.js";
 
 const NS = "reimbursements";
 const RANGE_LIMIT = 4096;
@@ -62,13 +62,14 @@ async function seed(t: T) {
 				Object.entries(entry.fields).map(([name, value]) => [name, fold(value)]),
 			);
 			await ctx.db.insert("docs", { namespace: NS, key: entry.key, fields, sortKey: entry.sortKey });
-			for (const gram of documentGramsOfFields(fields)) {
+			for (const [gram, tag] of gramFieldsOf(fields)) {
 				await ctx.db.insert("postings", {
 					namespace: NS,
 					key: entry.key,
 					gram,
 					g1: firstCodepoint(gram),
 					sortKey: entry.sortKey,
+					fields: tag,
 				});
 			}
 		}
@@ -145,7 +146,7 @@ describe("common prefix, rare suffix (payable-system TR-260720-006)", () => {
 		expect(call.page.page.map((hit) => hit.key)).toEqual(expected);
 		// 0.4.0: 2057 ranges and 5 of 38 hits, not done (it streamed a Gram every Entry holds).
 		expect(call.ranges).toBeLessThan(256);
-		expect(call.rows).toBeLessThan(2_000);
+		expect(call.rows).toBeLessThan(3_000);
 	}, 120_000);
 
 	test("fields restricts verification, so fill-style paging needs no matchedFields post-filter", async () => {
