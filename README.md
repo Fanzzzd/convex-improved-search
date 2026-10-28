@@ -287,9 +287,10 @@ fraction of the cost; paging naturally continues into older shards
 - A query folds identically. Two-codepoint queries stream one gram.
   Longer queries stream the scarcest gram (chosen by probing) and
   merge-join up to three others against it in index order. A candidate
-  reaches its document read only if it holds those grams and some wanted
-  field holds all of them. Single-codepoint queries use a first-codepoint
-  index. **Every candidate is then verified per field with
+  reaches its document only if it holds those grams and some wanted field
+  holds all of them. Single-codepoint queries use a first-codepoint index.
+  Documents are walked by a (sortKey, key) index in step with the
+  candidates. **Every candidate is then verified per field with
   `folded.includes(query)`** — the index is a pure candidate filter, so
   correctness never depends on the gram approximation (the same structural
   argument SQLite's FTS5 trigram tokenizer relies on), and `matchedFields`
@@ -321,17 +322,20 @@ fraction of the cost; paging naturally continues into older shards
 - **Ordering**: `sortKey` descending only. Changing an entry's `sortKey`
   rewrites all its posting rows synchronously; a change touching more than
   3000 surviving grams is refused. Prefer stable sort keys (creation time).
-- **Filters**: exact-match only, checked on the document. Each candidate a
-  filter rejects still costs one index range, so a filter that keeps 1 in
-  100 over a common substring costs about 100 ranges per hit. Postings do
-  not carry filter values: a filter change would then rewrite every
-  posting of the entry. When one filter value selects a small slice you
-  search often (a tenant, an archive flag), give it its own namespace.
+- **Filters**: exact-match only, checked on the document. Documents are
+  read in the same order as candidates, so a filter that keeps 1 in 100
+  over a common substring costs about 100 streamed rows per hit and few
+  index ranges. Each rejected candidate still counts against `budget`, so
+  such a page often comes back short with a cursor. When one filter value
+  selects a small slice you search often (a tenant, an archive flag), give
+  it its own namespace.
 - **Read cost**: one `search` call probes up to 16 of the query's grams,
   streams the sparsest, and merge-joins the next three against it, so a
-  rejected candidate costs streamed rows, not index ranges. Each verified
-  candidate costs one index range (`budget` caps them, default 256, max
-  768). Every call in one transaction shares Convex's limits (4096 index
+  rejected candidate costs streamed rows, not index ranges. Surviving
+  candidates are checked against their documents, read by walking the
+  documents in the same order: dense hits cost rows, and a far-apart hit
+  costs one index range. `budget` caps the candidates checked per call
+  (default 256, max 768). Every call in one transaction shares Convex's limits (4096 index
   ranges, 32000 rows, 16 MiB read, and 15 s of total database time) with
   your own reads and with every other `search` in it. Each call checks
   what the transaction has left, keeps 512 ranges, 4096 rows and 2 MiB for
@@ -359,8 +363,10 @@ fraction of the cost; paging naturally continues into older shards
   backfill (`syncDoc`/`set`) once to tag them: `set` reads one posting of
   an unchanged entry, sees the missing tag, and rewrites the tags.
   Entries you write after the upgrade are tagged as they are written.
-- The component's `search` result gains `verified`: candidates whose
-  document was read, at most `budget`, one index range each. `scanned`
+- `docs` gains the index `by_ns_sort`. Convex builds it on deploy; there
+  is nothing to run.
+- The component's `search` result gains `verified`: candidates checked
+  against their documents, at most `budget`. `scanned`
   still counts distinct candidates examined, but most of them are now
   rejected by their postings alone, so it can exceed `budget`. A loop that
   caps its cost should count `verified`. Prefer `fill: true` and `fields`

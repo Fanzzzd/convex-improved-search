@@ -7,6 +7,7 @@ import type { ComponentApi } from "../component/_generated/component.js";
 
 import { fold } from "../component/grams.js";
 import {
+  CALLS_PER_TRANSACTION,
   MAX_SCAN_BUDGET,
   normalizeBudget as normalizeSearchBudget,
   normalizeLimit as normalizeSearchLimit,
@@ -18,13 +19,13 @@ export { MAX_TEXT_LENGTH, fold } from "../component/grams.js";
 export type FilterValue = string | number | boolean | null;
 
 /**
- * `fill` bounds: total candidates verified across all calls (one index range
- * each, the component's `verified`) and calls per fill. The call cap bounds
- * the rows streamed past rejected candidates, which `verified` omits. Each
- * component call also caps itself at what the transaction has left.
+ * `fill` bounds: total candidates verified across all calls (the
+ * component's `verified`) and calls per fill. The call cap bounds the rows
+ * streamed past rejected candidates, which `verified` omits. Each component
+ * call also caps itself at what the transaction has left.
  */
 const FILL_SCAN_BUDGET = MAX_SCAN_BUDGET;
-const MAX_FILL_CALLS = 4;
+const MAX_FILL_CALLS = CALLS_PER_TRANSACTION;
 
 export type SearchHit = {
   key: string;
@@ -714,9 +715,9 @@ export class ShardedSearchIndex<Filter extends string = never> {
       inner = parsed.inner;
     }
 
-    // Each drained shard can cost up to ~budget*4 reads inside the shared
-    // transaction, so bound the shards visited per call accordingly.
-    const maxShards = Math.max(1, Math.min(8, Math.floor(3072 / (budget * 4))));
+    // Each shard call shares this transaction; the component plans for at
+    // most CALLS_PER_TRANSACTION of them (and caps each at what is left).
+    const maxShards = CALLS_PER_TRANSACTION;
 
     const page: SearchResultPage["page"] = [];
     for (let i = start; i < args.shards.length; i += 1) {

@@ -31,7 +31,10 @@ export default defineSchema({
 		fields: foldedFieldsValidator,
 		sortKey: v.number(),
 		filters: v.optional(filtersValidator),
-	}).index("by_ns_key", ["namespace", "key"]),
+	})
+		.index("by_ns_key", ["namespace", "key"])
+		// Search verifies candidates by walking this in step with them.
+		.index("by_ns_sort", ["namespace", "sortKey", "key"]),
 
 	/**
 	 * Inverted index: one row per (document, distinct gram). `g1` is the

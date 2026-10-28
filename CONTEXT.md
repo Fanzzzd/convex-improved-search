@@ -65,8 +65,8 @@ Verification. An absent field matches nothing; `null` is a real value.
 _Avoid_: facet, tag
 
 **Scan Budget**:
-The maximum number of candidates one `search` call may verify (one index
-range each). A call also stops early when its transaction runs low, since
+The maximum number of candidates one `search` call may verify. A call
+also stops early when its transaction runs low, since
 every call in a transaction shares one set of limits. Exhausting either
 ends the call, never the search.
 

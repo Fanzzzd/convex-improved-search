@@ -177,7 +177,8 @@ describe("common prefix, rare suffix (payable-system TR-260720-006)", () => {
 
 	test("a call that starts with little transaction headroom caps itself instead of overrunning", async () => {
 		const args = { query: "TR-26", fields: ["memo"], budget: 768, limit: 200 };
-		const { calls, totalRanges } = await inOneTransaction(t, args, 1, 3_500);
+		// 3590 used leaves 6 ranges past the 512 reserve: too few to drain.
+		const { calls, totalRanges } = await inOneTransaction(t, args, 1, 3_590);
 		expect(totalRanges).toBeLessThanOrEqual(RANGE_LIMIT);
 		expect(calls[0].page.isDone).toBe(false);
 		expect(calls[0].page.cursor).not.toBeNull();

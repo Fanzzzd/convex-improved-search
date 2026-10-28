@@ -168,11 +168,11 @@ describe("sharded search", () => {
 		const shards = ["a", "b", "c", "d", "e"];
 		const keys = await drain(makeIndex(), ctx, { shards, query: "x" });
 		expect(keys).toEqual([]);
-		// Default budget visits at most 3 shards per call → 5 empty shards need 2 calls.
+		// At most 4 shards per call → 5 empty shards need 2 calls.
 		expect(calls.length).toBe(5);
 	});
 
-	test("uses the effective child budget to cap shards visited per call", async () => {
+	test("visits at most CALLS_PER_TRANSACTION shards per call, each with the effective child budget", async () => {
 		const { ctx, calls } = makeCtx({});
 		const shards = Array.from({ length: 8 }, (_, i) => `s${i}`);
 		const first = await makeIndex().search(ctx as never, {
@@ -182,7 +182,7 @@ describe("sharded search", () => {
 			budget: 1,
 		});
 		expect(first.isDone).toBe(false);
-		expect(calls).toHaveLength(3);
+		expect(calls).toHaveLength(4);
 		expect(calls.every((call) => call.budget === 200)).toBe(true);
 	});
 

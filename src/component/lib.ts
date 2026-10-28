@@ -5,7 +5,7 @@ import type { IndexRange } from "convex/server";
 import type { Doc } from "./_generated/dataModel.js";
 import { internal } from "./_generated/api.js";
 import { filtersValidator, foldedFieldsValidator } from "./schema.js";
-import { normalizeBudget, normalizeLimit } from "./limits.js";
+import { CALLS_PER_TRANSACTION, normalizeBudget, normalizeLimit } from "./limits.js";
 import {
 	MAX_TEXT_LENGTH,
 	gramFieldsOf,
@@ -63,6 +63,8 @@ const LEAP_ROWS = 16;
  * pages of 7, 16 rows cost 4 more ranges than 0.4.0 over the drain.
  */
 const RESUME_ROWS = 64;
+/** The same, for the docs stream: doc rows are larger, so it reopens sooner. */
+const DOC_LEAP_ROWS = 8;
 const MIN_STREAM_ROWS = 64;
 const MAX_STREAM_ROWS = 4096;
 /** Transaction headroom every call leaves for the caller (hydration, its own reads). */
@@ -92,7 +94,7 @@ const searchResultValidator = v.object({
 	isDone: v.boolean(),
 	/** Distinct candidates examined this call, most of them rejected by their postings alone. */
 	scanned: v.number(),
-	/** Candidates whose doc was read (≤ budget, one index range each); lets callers cap a multi-call fill. */
+	/** Candidates checked against their doc (≤ budget); lets callers cap a multi-call fill. */
 	verified: v.number(),
 });
 
@@ -151,7 +153,7 @@ function cursorBefore(position: Position): Cursor {
  * caller's reads and every earlier `search` in the same transaction toward
  * one 4096-range / 32000-row limit, so a fixed per-call budget lets a
  * caller that loops over `search` overrun it. Without
- * getTransactionMetrics (older backends) only the static caps apply.
+ * getTransactionMetrics (older backends) a call takes its planned share.
  */
 async function transactionHeadroom(
 	ctx: QueryCtx,
@@ -164,7 +166,12 @@ async function transactionHeadroom(
 			docs: Math.floor((metrics.bytesRead.remaining - RESERVED_BYTES) / MAX_DOC_BYTES),
 		};
 	} catch {
-		return { ranges: Infinity, rows: Infinity, docs: Infinity };
+		// No metrics: assume a fresh transaction shared by CALLS_PER_TRANSACTION calls.
+		return {
+			ranges: Math.floor((4096 - RESERVED_RANGES) / CALLS_PER_TRANSACTION),
+			rows: Math.floor((32000 - RESERVED_ROWS) / CALLS_PER_TRANSACTION),
+			docs: Math.floor((16 * 1024 * 1024 - RESERVED_BYTES) / MAX_DOC_BYTES / CALLS_PER_TRANSACTION),
+		};
 	}
 }
 
@@ -277,46 +284,61 @@ async function probeGrams(
 	});
 }
 
+/** What a stream spends through: `must` spends past zero and still succeeds. */
+type Budget = { takeRow(must?: boolean): boolean; takeRange(must?: boolean): boolean };
+
+type SeekOptions = {
+	/** Stop at the target itself (true) or strictly after it. */
+	inclusive: boolean;
+	/** Overspend the budget rather than fail. */
+	must?: boolean;
+	/** Rows walked before each reopen. */
+	walk?: number;
+	/** False: give up after `walk` rows instead of reopening. */
+	reopen?: boolean;
+};
+
 /**
- * One gram's (or one g1's) postings in DESC (sortKey, key) order, read
- * through the call's budget. The candidate stream and every check stream
- * are PostingStreams, so "skip to the cursor" and "does candidate P hold
- * this gram" are the same move: `seek`.
+ * Rows of one index range in DESC (sortKey, key) order, read through the
+ * call's budget: one gram's (or one g1's) postings, or a namespace's docs.
+ * The candidate stream, every check stream and the docs stream are
+ * SortedStreams, so "skip to the cursor", "does candidate P hold this gram"
+ * and "read P's doc" are the same move: `seek`.
  *
- * `seek` walks the open range toward the target. After LEAP_ROWS rows it
- * reopens at the target's sortKey (one range), and after LEAP_ROWS more,
- * still inside the target's tie group, at the exact (sortKey, key) (one
- * range). So a seek costs at most 2·LEAP_ROWS rows and three ranges however
- * far the target is or however many entries share its sortKey. An exact
- * seek reads only the tie group; once that runs dry the stream is "below
- * sortKey" and opens the rest (`lt sortKey`) only when a later seek or
- * `next` needs it.
+ * `seek` walks the open range toward the target. After `walk` rows it
+ * reopens at the target's sortKey (one range), and after `walk` more, still
+ * inside the target's tie group, at the exact (sortKey, key) (one range).
+ * So a seek costs at most 2·walk+1 rows and three ranges, plus one range to
+ * open what lies below a drained tie group, however far the target is or
+ * however many entries share its sortKey. An exact seek reads only the tie
+ * group; once that runs dry the stream is "below sortKey" and opens the rest
+ * (`lt sortKey`) only when a later seek or `next` needs it. With `reopen`
+ * false the seek gives up after `walk` rows instead, leaving the head
+ * before the target.
  */
-class PostingStream {
-	private rows: AsyncIterator<Posting> | null = null;
+class SortedStream<Row extends Position> {
+	private rows: AsyncIterator<Row> | null = null;
 	/** Current row; null at the end. Meaningless while `below` is set. */
-	private current: Posting | null = null;
+	private current: Row | null = null;
 	/** Set when every row at this sortKey or above is behind the stream and the rest is unopened. */
 	private below: number | null = null;
 	/** The sortKey the open range is confined to, when it is an exact (tie group) range. */
 	private tieGroup: number | null = null;
 
 	constructor(
-		private readonly open: (seek: Seek | null) => AsyncIterator<Posting>,
-		private readonly budget: CallBudget,
+		private readonly open: (seek: Seek | null) => AsyncIterator<Row>,
+		private readonly budget: Budget,
 	) {}
 
 	/** The current row, or null at the end. Only valid after a successful seek/next. */
-	get head(): Posting | null {
+	get head(): Row | null {
 		return this.current;
 	}
 
 	/** Positions the stream at its first row ≤ target (`inclusive`) or < target. False when the budget ran out. */
 	async seek(
 		target: Position | null,
-		inclusive: boolean,
-		must = false,
-		leapRows = LEAP_ROWS,
+		{ inclusive, must = false, walk = LEAP_ROWS, reopen = true }: SeekOptions,
 	): Promise<boolean> {
 		const beyond = (row: Position) => {
 			const order = comparePositions(row, target!);
@@ -338,7 +360,8 @@ class PostingStream {
 				continue;
 			}
 			if (this.current === null || !beyond(this.current)) return true;
-			if (walked >= leapRows && stage !== "exact") {
+			if (walked >= walk && stage !== "exact") {
+				if (!reopen) return true;
 				walked = 0;
 				const inTieGroup = compareValues(this.current.sortKey, target.sortKey) === 0;
 				if (stage === "walk" && !inTieGroup) {
@@ -386,16 +409,18 @@ class PostingStream {
 }
 
 /**
- * Whether the candidate deserves a doc read: it holds every check gram, and
- * (when `tagged`) some wanted Field holds all of them, by the postings'
- * `fields` tags. A match lies inside one Field, so every query gram's tag
- * names it. `wanted` null means any Field; an untagged posting allows any.
- * Null when the call budget ran out first. With `mustDecide` the budget is
- * overspent instead, so every call gets past its first candidate.
+ * Whether the candidate deserves a doc read: it holds every check gram the
+ * check streams reach within their walk, and (when `retagging` is given)
+ * some wanted Field holds all of them, by the postings' `fields` tags. A
+ * match lies inside one Field, so every query gram's tag names it. `wanted`
+ * null means any Field; an untagged posting allows any. Removes from
+ * `checks` every stream that fell behind. Null when the call budget ran out
+ * first. With `mustDecide` the budget is overspent instead, so every call
+ * gets past its first candidate.
  */
 async function nominate(
 	posting: Posting,
-	checks: PostingStream[],
+	checks: SortedStream<Posting>[],
 	wanted: Set<string> | null,
 	retagging: (() => Promise<Set<string> | null>) | null,
 	mustDecide: boolean,
@@ -413,8 +438,16 @@ async function nominate(
 		return true;
 	};
 	if (!(await narrow(posting))) return false;
-	for (const check of checks) {
-		if (!(await check.seek(posting, true, mustDecide))) return null;
+	for (const check of [...checks]) {
+		// No reopen: a check stream that cannot walk to P cannot reject it
+		// for less than the one range the doc stream spends deciding. It is
+		// dropped for the rest of the call, since walking on from behind
+		// would spend rows on every later candidate too.
+		if (!(await check.seek(posting, { inclusive: true, must: mustDecide, reopen: false }))) return null;
+		if (check.head !== null && comparePositions(check.head, posting) > 0) {
+			checks.splice(checks.indexOf(check), 1);
+			continue;
+		}
 		if (check.head === null || comparePositions(check.head, posting) !== 0) return false;
 		if (!(await narrow(check.head))) return false;
 	}
@@ -485,15 +518,31 @@ export const search = query({
 			),
 			Math.min(budget * (1 + checkGrams.length), headroom.ranges - 1),
 		);
-		// Doc reads are what fill bytesRead; the first is always allowed.
-		const verifyCap = Math.max(1, Math.min(budget, headroom.docs));
 		const streamOf = (stream: StreamOf) =>
-			new PostingStream(
+			new SortedStream<Posting>(
 				(seek) => postingRange(ctx, args.namespace, stream, seek)[Symbol.asyncIterator](),
 				callBudget,
 			);
 		const candidates = streamOf(of);
 		const checks = checkGrams.map((gram) => streamOf({ gram }));
+		// Doc rows are what fill bytesRead, walked and verified alike.
+		let docRowsLeft = headroom.docs;
+		const docs = new SortedStream<Doc<"docs">>(
+			(seek) => {
+				const range = ctx.db
+					.query("docs")
+					.withIndex("by_ns_sort", (q) => applySeek(q.eq("namespace", args.namespace), seek))
+					.order("desc");
+				return range[Symbol.asyncIterator]();
+			},
+			{
+				takeRow: (must = false) => {
+					docRowsLeft -= 1;
+					return callBudget.takeRow(must) && (must || docRowsLeft >= 0);
+				},
+				takeRange: (must = false) => callBudget.takeRange(must),
+			},
+		);
 		// Read once, on the first rejection by tags: one range, and none for
 		// calls whose tags reject nothing. Too many retags turns tags off.
 		let pendingRetags: Promise<Set<string> | null> | undefined;
@@ -514,12 +563,12 @@ export const search = query({
 		let exhausted = true;
 		// `last` only moves past rows this call handled, so running out of
 		// budget anywhere leaves a cursor that never covers an unhandled row.
-		let more = await candidates.seek(
-			cursor === null ? null : { sortKey: cursor.s, key: cursor.k },
-			false,
-			true,
-			RESUME_ROWS,
-		) && await candidates.land(true);
+		let more =
+			(await candidates.seek(cursor === null ? null : { sortKey: cursor.s, key: cursor.k }, {
+				inclusive: false,
+				must: true,
+				walk: RESUME_ROWS,
+			})) && (await candidates.land(true));
 		while (more) {
 			const posting = candidates.head;
 			if (posting === null) break;
@@ -543,7 +592,11 @@ export const search = query({
 				"gram" in of ? retagging : null,
 				last === null,
 			);
-			if (nominated === null || (nominated && !callBudget.takeRange(last === null))) {
+			if (
+				nominated === null ||
+				(nominated &&
+					!(await docs.seek(posting, { inclusive: true, must: last === null, walk: DOC_LEAP_ROWS })))
+			) {
 				last = cursorBefore(posting);
 				exhausted = false;
 				break;
@@ -552,19 +605,12 @@ export const search = query({
 			examined += 1;
 			if (nominated) {
 				verified += 1;
-				callBudget.takeRow(true);
-				const matchedFields = await verifyCandidate(
-					ctx,
-					args.namespace,
-					posting,
-					wantedFilters,
-					folded,
-					fieldNames,
-				);
+				const doc = docs.head !== null && comparePositions(docs.head, posting) === 0 ? docs.head : null;
+				const matchedFields = verifyCandidate(doc, wantedFilters, folded, fieldNames);
 				if (matchedFields !== null) {
 					page.push({ key: posting.key, sortKey: posting.sortKey, matchedFields });
 				}
-				if (page.length >= limit || verified >= verifyCap) {
+				if (page.length >= limit || verified >= budget) {
 					exhausted = false;
 					break;
 				}
@@ -584,25 +630,19 @@ export const search = query({
 });
 
 /** The candidate's matched field names when it truly matches, else null. */
-async function verifyCandidate(
-	ctx: { db: QueryCtx["db"] },
-	namespace: string,
-	posting: Posting,
+function verifyCandidate(
+	doc: Doc<"docs"> | null,
 	wantedFilters: [string, string | number | boolean | null][],
 	foldedQuery: string,
 	fieldNames: Set<string> | null,
-): Promise<string[] | null> {
-	// The doc read, filters, and the exact per-field verification that makes
-	// the index a pure candidate filter: correctness never rests on the
-	// grams, and matched field names fall out for free.
-	const doc = await ctx.db
-		.query("docs")
-		.withIndex("by_ns_key", (q) => q.eq("namespace", namespace).eq("key", posting.key))
-		.unique();
-	// A posting whose sortKey disagrees with the doc is stale (its reap is
-	// pending); the live posting at doc.sortKey nominates the Entry instead.
-	// Object.is, not !==: the index orders -0 and 0 apart.
-	if (doc === null || !Object.is(doc.sortKey, posting.sortKey)) return null;
+): string[] | null {
+	// Filters, and the exact per-field verification that makes the index a
+	// pure candidate filter: correctness never rests on the grams, and
+	// matched field names fall out for free. `doc` is the docs row at the
+	// candidate's (sortKey, key), or null when none lives there: the Entry
+	// is gone, or the posting is stale (its reap is pending) and the live
+	// posting at doc.sortKey nominates the Entry instead.
+	if (doc === null) return null;
 	for (const [field, value] of wantedFilters) {
 		if (doc.filters?.[field] !== value) return null;
 	}
@@ -681,18 +721,12 @@ export const set = mutation({
 			// changed, the doc write too, so live searches do not rerun. Any
 			// leftover duplicates belong to a reap that is already scheduled.
 			// One posting read tells a pre-0.5.0 entry (untagged postings)
-			// apart, so re-running a backfill tags it.
+			// apart, so re-running a backfill tags it. An entry with no text
+			// has no postings and nothing to tag.
 			const postingsCurrent =
 				Object.is(existing.sortKey, args.sortKey) &&
 				sameFields(existing.fields, foldedFields) &&
-				(
-					await ctx.db
-						.query("postings")
-						.withIndex("by_ns_key", (q) =>
-							q.eq("namespace", args.namespace).eq("key", args.key),
-						)
-						.first()
-				)?.fields !== undefined;
+				(await isTagged(ctx, args.namespace, args.key, foldedFields));
 			if (postingsCurrent) {
 				if (!sameFilters(existing.filters, args.filters)) {
 					await ctx.db.replace("docs", existing._id, docRow);
@@ -794,6 +828,21 @@ function sameFields(a: Record<string, string>, b: Record<string, string>): boole
 		names.length === Object.keys(b).length &&
 		names.every((name) => Object.hasOwn(b, name) && a[name] === b[name])
 	);
+}
+
+/** Whether the entry's postings carry Field tags (written by 0.5.0 or later). */
+async function isTagged(
+	ctx: MutationCtx,
+	namespace: string,
+	key: string,
+	foldedFields: Record<string, string>,
+): Promise<boolean> {
+	const posting = await ctx.db
+		.query("postings")
+		.withIndex("by_ns_key", (q) => q.eq("namespace", namespace).eq("key", key))
+		.first();
+	if (posting === null) return Object.values(foldedFields).every((text) => text === "");
+	return posting.fields !== undefined;
 }
 
 async function markRetagging(ctx: MutationCtx, namespace: string, key: string) {

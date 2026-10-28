@@ -13,6 +13,14 @@ import { ConvexError } from "convex/values";
  * the budget runs out before the page fills, the returned cursor covers only
  * what was examined: callers keep paging and matches keep arriving.
  */
+/**
+ * The `search` calls one transaction is planned for: a `fill` makes at
+ * most this many, and a sharded search visits at most this many shards per
+ * call. Without transaction metrics a call cannot see what earlier calls
+ * spent, so it takes this share of the transaction's limits.
+ */
+export const CALLS_PER_TRANSACTION = 4;
+
 export const DEFAULT_SCAN_BUDGET = 256;
 export const MAX_SCAN_BUDGET = 768;
 export const DEFAULT_LIMIT = 50;
