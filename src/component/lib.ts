@@ -56,6 +56,13 @@ const ROWS_PER_CANDIDATE = 16;
  * outweigh the rows added at the limits' ratio (4096 ranges : 32000 rows).
  */
 const LEAP_ROWS = 16;
+/**
+ * The same, for the candidate stream's one seek per call to the cursor. An
+ * exact seek inside a tie group costs a second range once the group drains,
+ * so the resume walks further first: on 40 Entries sharing one sortKey and
+ * pages of 7, 16 rows cost 4 more ranges than 0.4.0 over the drain.
+ */
+const RESUME_ROWS = 64;
 const MIN_STREAM_ROWS = 64;
 const MAX_STREAM_ROWS = 4096;
 /** Transaction headroom every call leaves for the caller (hydration, its own reads). */
@@ -305,7 +312,12 @@ class PostingStream {
 	}
 
 	/** Positions the stream at its first row ≤ target (`inclusive`) or < target. False when the budget ran out. */
-	async seek(target: Position | null, inclusive: boolean, must = false): Promise<boolean> {
+	async seek(
+		target: Position | null,
+		inclusive: boolean,
+		must = false,
+		leapRows = LEAP_ROWS,
+	): Promise<boolean> {
 		const beyond = (row: Position) => {
 			const order = comparePositions(row, target!);
 			return inclusive ? order > 0 : order >= 0;
@@ -326,7 +338,7 @@ class PostingStream {
 				continue;
 			}
 			if (this.current === null || !beyond(this.current)) return true;
-			if (walked >= LEAP_ROWS && stage !== "exact") {
+			if (walked >= leapRows && stage !== "exact") {
 				walked = 0;
 				const inTieGroup = compareValues(this.current.sortKey, target.sortKey) === 0;
 				if (stage === "walk" && !inTieGroup) {
@@ -450,10 +462,14 @@ export const search = query({
 		// page — never affects correctness, only cost.
 		let of: StreamOf;
 		let checkGrams: string[] = [];
+		const grams = codepointCount === 1 ? [] : queryGrams(folded);
 		if (codepointCount === 1) {
 			of = { g1: folded };
+		} else if (grams.length === 1) {
+			// One gram (two codepoints, or "aaa"): nothing to rank, stream it.
+			of = { gram: grams[0] };
 		} else {
-			const probed = await probeGrams(ctx, args.namespace, queryGrams(folded), cursor);
+			const probed = await probeGrams(ctx, args.namespace, grams, cursor);
 			// Every match holds every query gram, so an empty gram ends the search.
 			if (probed[0].rows === 0) return done;
 			of = { gram: probed[0].gram };
@@ -502,6 +518,7 @@ export const search = query({
 			cursor === null ? null : { sortKey: cursor.s, key: cursor.k },
 			false,
 			true,
+			RESUME_ROWS,
 		) && await candidates.land(true);
 		while (more) {
 			const posting = candidates.head;

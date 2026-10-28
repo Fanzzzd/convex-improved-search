@@ -315,8 +315,9 @@ fraction of the cost; paging naturally continues into older shards
   entry cannot be unindexed synchronously.)
 - **Writes**: `set` compares the new entry with the stored one first. When
   the folded text and `sortKey` are unchanged it skips the posting diff, so
-  re-syncing an unchanged document or changing only its filters costs one
-  row read and at most one row write.
+  re-syncing an unchanged document or changing only its filters costs two
+  row reads (the entry and one of its postings, to check its Field tags)
+  and at most one row write.
 - **Ordering**: `sortKey` descending only. Changing an entry's `sortKey`
   rewrites all its posting rows synchronously; a change touching more than
   3000 surviving grams is refused. Prefer stable sort keys (creation time).
