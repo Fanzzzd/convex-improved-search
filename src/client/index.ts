@@ -79,9 +79,9 @@ export type SearchArgs<Filter extends string = never> = {
   cursor?: string | null;
   limit?: number;
   /**
-   * Max candidates verified this call (each costs one index range). Raise for
+   * Max candidates verified against their documents this call. Raise for
    * very selective filters. Under `fill`, the cap across all calls (default
-   * and maximum 768). Every call shares the transaction's 4096 index ranges
+   * and maximum 768). Every call shares the transaction's read limits
    * with your own reads and with every other `search` in the same query, so
    * the component also stops early when the transaction runs low: the page
    * comes back short with a cursor, as when the budget runs out.

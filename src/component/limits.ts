@@ -1,18 +1,10 @@
 import { ConvexError } from "convex/values";
 
 /**
- * Page size and Scan Budget bounds, shared by the component and the client
- * (which needs them for `fill` and sharded bookkeeping).
- *
- * The Scan Budget: how many candidates one `search` call may verify. A
- * candidate reaches Verification only after it holds every check gram (and,
- * by the postings' tags, some wanted Field), and Verification costs one
- * index range (the doc read). Convex allows 4096 index ranges per
- * transaction, shared with the caller and with every other `search` call in
- * it, so each call also caps itself at what the transaction has left. When
- * the budget runs out before the page fills, the returned cursor covers only
- * what was examined: callers keep paging and matches keep arriving.
+ * Limits shared by the component and the client (which needs them for
+ * `fill` and sharded bookkeeping).
  */
+
 /**
  * The `search` calls one transaction is planned for: a `fill` makes at
  * most this many, and a sharded search visits at most this many shards per
@@ -21,6 +13,17 @@ import { ConvexError } from "convex/values";
  */
 export const CALLS_PER_TRANSACTION = 4;
 
+/**
+ * The Scan Budget: how many candidates one `search` call may verify
+ * against their docs. A candidate reaches Verification only after it holds
+ * every check gram (and, by the postings' tags, some wanted Field). Docs are
+ * walked in the candidates' order, so Verification costs rows, plus one
+ * index range when the next candidate lies far ahead. Every call in a
+ * transaction shares Convex's limits with the caller, so each call also
+ * caps itself at what the transaction has left. When the budget runs out
+ * before the page fills, the returned cursor covers only what was examined:
+ * callers keep paging and matches keep arriving.
+ */
 export const DEFAULT_SCAN_BUDGET = 256;
 export const MAX_SCAN_BUDGET = 768;
 export const DEFAULT_LIMIT = 50;

@@ -170,6 +170,57 @@ describe("search over a messy index", () => {
 		}
 	});
 
+	test("a plan the corpus outgrows swaps its candidate gram mid-call and loses nothing", { timeout: 600_000 }, async () => {
+		// "ab" is sparse in the newest 400 and in every older doc; "bc" the
+		// reverse. The probe picks "ab", which turns dense further on.
+		const entries = Array.from({ length: 2000 }, (_, i) => {
+			const hasAB = i < 400 ? i % 40 === 0 : true;
+			const hasBC = i < 400 ? true : i % 100 === 0;
+			return {
+				key: `d${String(i).padStart(5, "0")}`,
+				fields: { text: (hasAB ? "xab" : "x") + (hasBC ? " bc" : "") + (hasAB && hasBC && i % 2 === 0 ? " abc" : "") },
+				sortKey: 2000 - i,
+			};
+		});
+		const t = initConvexTest();
+		await seed(t, entries);
+		for (const limit of [3, 50]) {
+			const drained = await drain(t, { query: "abc", limit });
+			expect(drained.hits, `limit ${limit}`).toEqual(oracle(entries, "abc"));
+			expect(drained.maxCallRows).toBeLessThan(2000);
+		}
+	});
+
+	test("dense candidates switch a call to walking docs alone, and back when they thin out", { timeout: 600_000 }, async () => {
+		// The newest 300 all hold 停車 (half match 停車場); the older 600 hold
+		// it 1 in 20. Two Fields, so `fields` and tags also take part.
+		const entries = Array.from({ length: 900 }, (_, i) => {
+			const dense = i < 300;
+			const holds = dense || i % 20 === 0;
+			const text = holds ? (i % 2 === 0 ? "停車場月租" : "停車費") : "過磅單";
+			return {
+				key: `e${String(i).padStart(4, "0")}`,
+				fields: i % 3 === 0 ? { title: text, memo: "x" } : { title: "y", memo: text },
+				sortKey: 900 - i,
+			};
+		});
+		const t = initConvexTest();
+		await seed(t, entries);
+		for (const [query, limit, budget, fields] of [
+			["停車場", 200, undefined, undefined],
+			["停車場", 40, 64, undefined],
+			["停車", 7, undefined, undefined],
+			["停", 50, 100, undefined],
+			["停車場", 50, undefined, ["memo"]],
+		] as const) {
+			const wanted = fields === undefined ? undefined : [...fields];
+			const drained = await drain(t, { query, limit, budget, fields: wanted });
+			expect(drained.hits, `${query} limit ${limit} budget ${budget} fields ${fields}`).toEqual(
+				oracle(entries, query, wanted),
+			);
+		}
+	});
+
 	test("a large tie group costs each call a bounded number of rows", { timeout: 600_000 }, async () => {
 		// Every entry shares sortKey 0; "abcx" is in 1 of 50, its other grams in all of them.
 		const entries = Array.from({ length: 3000 }, (_, i) => ({

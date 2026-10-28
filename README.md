@@ -290,7 +290,8 @@ fraction of the cost; paging naturally continues into older shards
   reaches its document only if it holds those grams and some wanted field
   holds all of them. Single-codepoint queries use a first-codepoint index.
   Documents are walked by a (sortKey, key) index in step with the
-  candidates. **Every candidate is then verified per field with
+  candidates. When most documents are candidates anyway, the call walks
+  the documents alone. **Every candidate is then verified per field with
   `folded.includes(query)`** — the index is a pure candidate filter, so
   correctness never depends on the gram approximation (the same structural
   argument SQLite's FTS5 trigram tokenizer relies on), and `matchedFields`
@@ -334,7 +335,8 @@ fraction of the cost; paging naturally continues into older shards
   rejected candidate costs streamed rows, not index ranges. Surviving
   candidates are checked against their documents, read by walking the
   documents in the same order: dense hits cost rows, and a far-apart hit
-  costs one index range. `budget` caps the candidates checked per call
+  costs one index range. The cursor carries the chosen grams, so the next
+  page skips probing. `budget` caps the candidates checked per call
   (default 256, max 768). Every call in one transaction shares Convex's limits (4096 index
   ranges, 32000 rows, 16 MiB read, and 15 s of total database time) with
   your own reads and with every other `search` in it. Each call checks
