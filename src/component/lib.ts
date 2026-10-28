@@ -5,7 +5,11 @@ import type { IndexRange } from "convex/server";
 import type { Doc } from "./_generated/dataModel.js";
 import { internal } from "./_generated/api.js";
 import { filtersValidator, foldedFieldsValidator } from "./schema.js";
-import { CALLS_PER_TRANSACTION, normalizeBudget, normalizeLimit } from "./limits.js";
+import {
+	CALLS_PER_TRANSACTION,
+	normalizeBudget,
+	normalizeLimit,
+} from "./limits.js";
 import {
 	MAX_TEXT_LENGTH,
 	gramFieldsOf,
@@ -30,7 +34,6 @@ import {
 const SYNC_DELETE_BUDGET = 800;
 const SYNC_PATCH_LIMIT = 3000;
 const REAP_BATCH = 3000;
-
 
 /**
  * Gram selection. A probe reads the first PROBE_ROWS postings of one query
@@ -125,7 +128,9 @@ function decodeCursor(raw: string | null | undefined): Cursor | null {
 	}
 }
 
-function assertFiniteFilters(filters: Record<string, string | number | boolean | null> | undefined) {
+function assertFiniteFilters(
+	filters: Record<string, string | number | boolean | null> | undefined,
+) {
 	for (const [field, value] of Object.entries(filters ?? {})) {
 		if (typeof value === "number" && !Number.isFinite(value)) {
 			throw new ConvexError(`Filter "${field}" must be a finite number`);
@@ -163,14 +168,20 @@ async function transactionHeadroom(
 		return {
 			ranges: metrics.databaseQueries.remaining - RESERVED_RANGES,
 			rows: metrics.documentsRead.remaining - RESERVED_ROWS,
-			docs: Math.floor((metrics.bytesRead.remaining - RESERVED_BYTES) / MAX_DOC_BYTES),
+			docs: Math.floor(
+				(metrics.bytesRead.remaining - RESERVED_BYTES) / MAX_DOC_BYTES,
+			),
 		};
 	} catch {
 		// No metrics: assume a fresh transaction shared by CALLS_PER_TRANSACTION calls.
 		return {
 			ranges: Math.floor((4096 - RESERVED_RANGES) / CALLS_PER_TRANSACTION),
 			rows: Math.floor((32000 - RESERVED_ROWS) / CALLS_PER_TRANSACTION),
-			docs: Math.floor((16 * 1024 * 1024 - RESERVED_BYTES) / MAX_DOC_BYTES / CALLS_PER_TRANSACTION),
+			docs: Math.floor(
+				(16 * 1024 * 1024 - RESERVED_BYTES) /
+					MAX_DOC_BYTES /
+					CALLS_PER_TRANSACTION,
+			),
 		};
 	}
 }
@@ -202,7 +213,10 @@ type Seek =
 
 /** by_ns_gram and by_ns_g1 after their two equality fields: both end in (sortKey, key). */
 interface SortKeyKeyRange extends IndexRange {
-	eq(field: "sortKey", value: number): {
+	eq(
+		field: "sortKey",
+		value: number,
+	): {
 		lte(field: "key", value: string): IndexRange;
 		lt(field: "key", value: string): IndexRange;
 	};
@@ -210,10 +224,7 @@ interface SortKeyKeyRange extends IndexRange {
 	lt(field: "sortKey", value: number): IndexRange;
 }
 
-function applySeek(
-	q: SortKeyKeyRange,
-	seek: Seek | null,
-): IndexRange {
+function applySeek(q: SortKeyKeyRange, seek: Seek | null): IndexRange {
 	if (seek === null) return q;
 	switch (seek.op) {
 		case "lte":
@@ -271,21 +282,29 @@ async function probeGrams(
 	grams: string[],
 	cursor: Cursor | null,
 ): Promise<{ gram: string; rows: number }[]> {
-	const seek: Seek | null = cursor === null ? null : { op: "lte", sortKey: cursor.s };
+	const seek: Seek | null =
+		cursor === null ? null : { op: "lte", sortKey: cursor.s };
 	const probed = await Promise.all(
 		spread(grams, MAX_PROBE_GRAMS).map(async (gram) => {
-			const rows = await postingRange(ctx, namespace, { gram }, seek).take(PROBE_ROWS);
+			const rows = await postingRange(ctx, namespace, { gram }, seek).take(
+				PROBE_ROWS,
+			);
 			return { gram, rows: rows.length, last: rows.at(-1) ?? null };
 		}),
 	);
 	return probed.sort((a, b) => {
 		if (a.rows < PROBE_ROWS || b.rows < PROBE_ROWS) return a.rows - b.rows;
-		return a.last === null || b.last === null ? 0 : comparePositions(a.last, b.last);
+		return a.last === null || b.last === null
+			? 0
+			: comparePositions(a.last, b.last);
 	});
 }
 
 /** What a stream spends through: `must` spends past zero and still succeeds. */
-type Budget = { takeRow(must?: boolean): boolean; takeRange(must?: boolean): boolean };
+type Budget = {
+	takeRow(must?: boolean): boolean;
+	takeRange(must?: boolean): boolean;
+};
 
 type SeekOptions = {
 	/** Stop at the target itself (true) or strictly after it. */
@@ -347,7 +366,8 @@ class SortedStream<Row extends Position> {
 		let stage: "walk" | "sortKey" | "exact" = "walk";
 		if (this.rows === null) {
 			stage = "sortKey";
-			const seek: Seek | null = target === null ? null : { op: "lte", sortKey: target.sortKey };
+			const seek: Seek | null =
+				target === null ? null : { op: "lte", sortKey: target.sortKey };
 			if (!(await this.reopen(seek, must))) return false;
 		}
 		if (target === null) return true;
@@ -363,14 +383,24 @@ class SortedStream<Row extends Position> {
 			if (walked >= walk && stage !== "exact") {
 				if (!reopen) return true;
 				walked = 0;
-				const inTieGroup = compareValues(this.current.sortKey, target.sortKey) === 0;
+				const inTieGroup =
+					compareValues(this.current.sortKey, target.sortKey) === 0;
 				if (stage === "walk" && !inTieGroup) {
 					stage = "sortKey";
-					if (!(await this.reopen({ op: "lte", sortKey: target.sortKey }, must))) return false;
+					if (
+						!(await this.reopen({ op: "lte", sortKey: target.sortKey }, must))
+					)
+						return false;
 				} else {
 					stage = "exact";
 					const op = inclusive ? "tieLte" : "tieLt";
-					if (!(await this.reopen({ op, sortKey: target.sortKey, key: target.key }, must))) return false;
+					if (
+						!(await this.reopen(
+							{ op, sortKey: target.sortKey, key: target.key },
+							must,
+						))
+					)
+						return false;
 				}
 				continue;
 			}
@@ -394,7 +424,8 @@ class SortedStream<Row extends Position> {
 		if (!this.budget.takeRange(must)) return false;
 		this.rows = this.open(seek);
 		this.below = null;
-		this.tieGroup = seek?.op === "tieLte" || seek?.op === "tieLt" ? seek.sortKey : null;
+		this.tieGroup =
+			seek?.op === "tieLte" || seek?.op === "tieLt" ? seek.sortKey : null;
 		return await this.advance(must);
 	}
 
@@ -429,7 +460,11 @@ async function nominate(
 	let allowed = wanted;
 	const narrow = async (row: Posting) => {
 		if (!useTags || row.fields === undefined) return true;
-		allowed = new Set(allowed === null ? row.fields : row.fields.filter((name) => allowed!.has(name)));
+		allowed = new Set(
+			allowed === null
+				? row.fields
+				: row.fields.filter((name) => allowed!.has(name)),
+		);
 		if (allowed.size > 0) return true;
 		// Tags reject only Entries the reaper is not retagging.
 		const pending = await retagging!();
@@ -443,12 +478,20 @@ async function nominate(
 		// for less than the one range the doc stream spends deciding. It is
 		// dropped for the rest of the call, since walking on from behind
 		// would spend rows on every later candidate too.
-		if (!(await check.seek(posting, { inclusive: true, must: mustDecide, reopen: false }))) return null;
+		if (
+			!(await check.seek(posting, {
+				inclusive: true,
+				must: mustDecide,
+				reopen: false,
+			}))
+		)
+			return null;
 		if (check.head !== null && comparePositions(check.head, posting) > 0) {
 			checks.splice(checks.indexOf(check), 1);
 			continue;
 		}
-		if (check.head === null || comparePositions(check.head, posting) !== 0) return false;
+		if (check.head === null || comparePositions(check.head, posting) !== 0)
+			return false;
 		if (!(await narrow(check.head))) return false;
 	}
 	return true;
@@ -470,7 +513,13 @@ export const search = query({
 		const limit = normalizeLimit(args.limit);
 		const budget = normalizeBudget(args.budget, limit);
 		assertFiniteFilters(args.filters);
-		const done = { page: [], cursor: null, isDone: true, scanned: 0, verified: 0 };
+		const done = {
+			page: [],
+			cursor: null,
+			isDone: true,
+			scanned: 0,
+			verified: 0,
+		};
 		const fieldNames = args.fields === undefined ? null : new Set(args.fields);
 		if (fieldNames !== null && fieldNames.size === 0) return done;
 		const folded = fold(args.query);
@@ -520,7 +569,10 @@ export const search = query({
 		);
 		const streamOf = (stream: StreamOf) =>
 			new SortedStream<Posting>(
-				(seek) => postingRange(ctx, args.namespace, stream, seek)[Symbol.asyncIterator](),
+				(seek) =>
+					postingRange(ctx, args.namespace, stream, seek)[
+						Symbol.asyncIterator
+					](),
 				callBudget,
 			);
 		const candidates = streamOf(of);
@@ -531,7 +583,9 @@ export const search = query({
 			(seek) => {
 				const range = ctx.db
 					.query("docs")
-					.withIndex("by_ns_sort", (q) => applySeek(q.eq("namespace", args.namespace), seek))
+					.withIndex("by_ns_sort", (q) =>
+						applySeek(q.eq("namespace", args.namespace), seek),
+					)
 					.order("desc");
 				return range[Symbol.asyncIterator]();
 			},
@@ -553,10 +607,13 @@ export const search = query({
 					.query("retagging")
 					.withIndex("by_ns_key", (q) => q.eq("namespace", args.namespace))
 					.take(MAX_RETAGGING + 1);
-				return rows.length > MAX_RETAGGING ? null : new Set(rows.map((row) => row.key));
+				return rows.length > MAX_RETAGGING
+					? null
+					: new Set(rows.map((row) => row.key));
 			})());
 
-		const page: { key: string; sortKey: number; matchedFields: string[] }[] = [];
+		const page: { key: string; sortKey: number; matchedFields: string[] }[] =
+			[];
 		let verified = 0;
 		let examined = 0;
 		let last: Cursor | null = null;
@@ -564,11 +621,14 @@ export const search = query({
 		// `last` only moves past rows this call handled, so running out of
 		// budget anywhere leaves a cursor that never covers an unhandled row.
 		let more =
-			(await candidates.seek(cursor === null ? null : { sortKey: cursor.s, key: cursor.k }, {
-				inclusive: false,
-				must: true,
-				walk: RESUME_ROWS,
-			})) && (await candidates.land(true));
+			(await candidates.seek(
+				cursor === null ? null : { sortKey: cursor.s, key: cursor.k },
+				{
+					inclusive: false,
+					must: true,
+					walk: RESUME_ROWS,
+				},
+			)) && (await candidates.land(true));
 		while (more) {
 			const posting = candidates.head;
 			if (posting === null) break;
@@ -580,7 +640,10 @@ export const search = query({
 			// One document can own several adjacent rows at one position in
 			// this stream (all its g1 grams; briefly, duplicates while a reap
 			// is pending).
-			if (last !== null && comparePositions(posting, { sortKey: last.s, key: last.k }) === 0) {
+			if (
+				last !== null &&
+				comparePositions(posting, { sortKey: last.s, key: last.k }) === 0
+			) {
 				more = await candidates.next();
 				continue;
 			}
@@ -595,7 +658,11 @@ export const search = query({
 			if (
 				nominated === null ||
 				(nominated &&
-					!(await docs.seek(posting, { inclusive: true, must: last === null, walk: DOC_LEAP_ROWS })))
+					!(await docs.seek(posting, {
+						inclusive: true,
+						must: last === null,
+						walk: DOC_LEAP_ROWS,
+					})))
 			) {
 				last = cursorBefore(posting);
 				exhausted = false;
@@ -605,10 +672,22 @@ export const search = query({
 			examined += 1;
 			if (nominated) {
 				verified += 1;
-				const doc = docs.head !== null && comparePositions(docs.head, posting) === 0 ? docs.head : null;
-				const matchedFields = verifyCandidate(doc, wantedFilters, folded, fieldNames);
+				const doc =
+					docs.head !== null && comparePositions(docs.head, posting) === 0
+						? docs.head
+						: null;
+				const matchedFields = verifyCandidate(
+					doc,
+					wantedFilters,
+					folded,
+					fieldNames,
+				);
 				if (matchedFields !== null) {
-					page.push({ key: posting.key, sortKey: posting.sortKey, matchedFields });
+					page.push({
+						key: posting.key,
+						sortKey: posting.sortKey,
+						matchedFields,
+					});
 				}
 				if (page.length >= limit || verified >= budget) {
 					exhausted = false;
@@ -649,7 +728,8 @@ function verifyCandidate(
 	const matchedFields = Object.entries(doc.fields)
 		.filter(
 			([name, folded]) =>
-				(fieldNames === null || fieldNames.has(name)) && folded.includes(foldedQuery),
+				(fieldNames === null || fieldNames.has(name)) &&
+				folded.includes(foldedQuery),
 		)
 		.map(([name]) => name);
 	return matchedFields.length === 0 ? null : matchedFields;
@@ -692,7 +772,8 @@ export const set = mutation({
 						`Fields exceed ${MAX_TEXT_LENGTH} codepoints after folding`,
 					);
 				}
-				if (budget > 0) foldedFields[field.name] = truncateCodepoints(folded, budget);
+				if (budget > 0)
+					foldedFields[field.name] = truncateCodepoints(folded, budget);
 				budget = 0;
 				continue;
 			}
@@ -760,7 +841,8 @@ export const set = mutation({
 			const tag = newGrams.get(postingRow.gram);
 			if (
 				tag !== undefined &&
-				(!Object.is(postingRow.sortKey, args.sortKey) || !sameTag(postingRow.fields, tag))
+				(!Object.is(postingRow.sortKey, args.sortKey) ||
+					!sameTag(postingRow.fields, tag))
 			) {
 				toPatch.push(postingRow);
 			}
@@ -769,7 +851,9 @@ export const set = mutation({
 		// Tag-only patches past the limit (a Field rename over a large text)
 		// go to the reaper, and the `retagging` row makes search ignore this
 		// Entry's tags until it is done.
-		const sortKeyPatches = toPatch.filter((p) => !Object.is(p.sortKey, args.sortKey));
+		const sortKeyPatches = toPatch.filter(
+			(p) => !Object.is(p.sortKey, args.sortKey),
+		);
 		if (sortKeyPatches.length > SYNC_PATCH_LIMIT) {
 			throw new ConvexError(
 				`Changing the sortKey of "${args.key}" would rewrite ${sortKeyPatches.length} ` +
@@ -790,7 +874,10 @@ export const set = mutation({
 		// Deletes are deferrable (stale postings are only false candidates), so
 		// spend a small inline budget and hand the rest to the reaper. A dup
 		// row (same gram twice, from an earlier deferred remove) also needs it.
-		let deleteBudget = Math.min(SYNC_DELETE_BUDGET, SYNC_PATCH_LIMIT - patchNow.length);
+		let deleteBudget = Math.min(
+			SYNC_DELETE_BUDGET,
+			SYNC_PATCH_LIMIT - patchNow.length,
+		);
 		let deferred = retag || oldPostings.length !== oldByGram.size;
 		for (const postingRow of toDelete) {
 			if (deleteBudget <= 0) {
@@ -822,7 +909,10 @@ export const set = mutation({
 	},
 });
 
-function sameFields(a: Record<string, string>, b: Record<string, string>): boolean {
+function sameFields(
+	a: Record<string, string>,
+	b: Record<string, string>,
+): boolean {
 	const names = Object.keys(a);
 	return (
 		names.length === Object.keys(b).length &&
@@ -841,7 +931,8 @@ async function isTagged(
 		.query("postings")
 		.withIndex("by_ns_key", (q) => q.eq("namespace", namespace).eq("key", key))
 		.first();
-	if (posting === null) return Object.values(foldedFields).every((text) => text === "");
+	if (posting === null)
+		return Object.values(foldedFields).every((text) => text === "");
 	return posting.fields !== undefined;
 }
 
@@ -854,7 +945,11 @@ async function markRetagging(ctx: MutationCtx, namespace: string, key: string) {
 }
 
 function sameTag(a: string[] | undefined, b: string[]): boolean {
-	return a !== undefined && a.length === b.length && a.every((name, i) => name === b[i]);
+	return (
+		a !== undefined &&
+		a.length === b.length &&
+		a.every((name, i) => name === b[i])
+	);
 }
 
 type Filters = Record<string, string | number | boolean | null>;
@@ -946,8 +1041,14 @@ export const reapKey = internalMutation({
 				ops += 1;
 			} else {
 				const tag = validGrams.get(posting.gram)!;
-				if (!Object.is(posting.sortKey, doc!.sortKey) || !sameTag(posting.fields, tag)) {
-					await ctx.db.patch("postings", posting._id, { sortKey: doc!.sortKey, fields: tag });
+				if (
+					!Object.is(posting.sortKey, doc!.sortKey) ||
+					!sameTag(posting.fields, tag)
+				) {
+					await ctx.db.patch("postings", posting._id, {
+						sortKey: doc!.sortKey,
+						fields: tag,
+					});
 					ops += 1;
 				}
 			}
@@ -955,7 +1056,9 @@ export const reapKey = internalMutation({
 		// The whole walk ran in this transaction, so every tag is current.
 		const marks = await ctx.db
 			.query("retagging")
-			.withIndex("by_ns_key", (q) => q.eq("namespace", args.namespace).eq("key", args.key))
+			.withIndex("by_ns_key", (q) =>
+				q.eq("namespace", args.namespace).eq("key", args.key),
+			)
 			.collect();
 		for (const mark of marks) await ctx.db.delete("retagging", mark._id);
 		return null;
