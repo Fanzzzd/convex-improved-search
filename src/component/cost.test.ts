@@ -31,7 +31,11 @@ type Page = {
 };
 
 /** One number per day of 2026, ten per day; the memo of every 97th cites TR-260720-006. */
-function corpus(): { key: string; fields: Record<string, string>; sortKey: number }[] {
+function corpus(): {
+	key: string;
+	fields: Record<string, string>;
+	sortKey: number;
+}[] {
 	const entries = [];
 	let sortKey = 0;
 	for (let day = 0; day < 365; day++) {
@@ -44,7 +48,8 @@ function corpus(): { key: string; fields: Record<string, string>; sortKey: numbe
 				key: no,
 				fields: {
 					no,
-					memo: sortKey % 97 === 0 ? "補單，原單 TR-260720-006" : "司機墊付停車費",
+					memo:
+						sortKey % 97 === 0 ? "補單，原單 TR-260720-006" : "司機墊付停車費",
 				},
 				sortKey,
 			});
@@ -59,9 +64,17 @@ async function seed(t: T) {
 	await t.run(async (ctx) => {
 		for (const entry of entries) {
 			const fields = Object.fromEntries(
-				Object.entries(entry.fields).map(([name, value]) => [name, fold(value)]),
+				Object.entries(entry.fields).map(([name, value]) => [
+					name,
+					fold(value),
+				]),
 			);
-			await ctx.db.insert("docs", { namespace: NS, key: entry.key, fields, sortKey: entry.sortKey });
+			await ctx.db.insert("docs", {
+				namespace: NS,
+				key: entry.key,
+				fields,
+				sortKey: entry.sortKey,
+			});
 			for (const [gram, tag] of gramFieldsOf(fields)) {
 				await ctx.db.insert("postings", {
 					namespace: NS,
@@ -98,7 +111,11 @@ async function inOneTransaction(
 		let cursor: string | null = null;
 		for (let i = 0; i < calls; i++) {
 			const start = await ctx.meta.getTransactionMetrics();
-			const page: Page = await ctx.runQuery(api.lib.search, { namespace: NS, ...args, cursor });
+			const page: Page = await ctx.runQuery(api.lib.search, {
+				namespace: NS,
+				...args,
+				cursor,
+			});
 			const end = await ctx.meta.getTransactionMetrics();
 			out.push({
 				page,
@@ -118,7 +135,11 @@ async function drain(t: T, args: SearchArgs): Promise<string[]> {
 	const keys: string[] = [];
 	let cursor: string | null = null;
 	for (let round = 0; round < 500; round++) {
-		const result: Page = await t.query(api.lib.search, { namespace: NS, ...args, cursor });
+		const result: Page = await t.query(api.lib.search, {
+			namespace: NS,
+			...args,
+			cursor,
+		});
 		keys.push(...result.page.map((hit) => hit.key));
 		if (result.isDone) return keys;
 		cursor = result.cursor;
@@ -135,11 +156,19 @@ describe("common prefix, rare suffix (payable-system TR-260720-006)", () => {
 	}, 120_000);
 
 	test("one call finds the number and finishes, in under 256 index ranges", async () => {
-		const { calls } = await inOneTransaction(t, { query: "TR-260720-006", budget: 512 }, 1);
+		const { calls } = await inOneTransaction(
+			t,
+			{ query: "TR-260720-006", budget: 512 },
+			1,
+		);
 		const [call] = calls;
 		expect(call.page.isDone).toBe(true);
 		const expected = corpus()
-			.filter((entry) => Object.values(entry.fields).some((text) => text.includes("TR-260720-006")))
+			.filter((entry) =>
+				Object.values(entry.fields).some((text) =>
+					text.includes("TR-260720-006"),
+				),
+			)
 			.reverse()
 			.map((entry) => entry.key);
 		expect(expected).toContain("TR-260720-006");
@@ -155,9 +184,9 @@ describe("common prefix, rare suffix (payable-system TR-260720-006)", () => {
 			{ query: "TR-260720-006", fields: ["no"], budget: 512 },
 			1,
 		);
-		expect(calls[0].page.page.map((hit) => [hit.key, hit.matchedFields])).toEqual([
-			["TR-260720-006", ["no"]],
-		]);
+		expect(
+			calls[0].page.page.map((hit) => [hit.key, hit.matchedFields]),
+		).toEqual([["TR-260720-006", ["no"]]]);
 		expect(calls[0].page.isDone).toBe(true);
 	}, 120_000);
 
@@ -167,12 +196,16 @@ describe("common prefix, rare suffix (payable-system TR-260720-006)", () => {
 		const args = { query: "TR-26", fields: ["memo"], budget: 512, limit: 50 };
 		const { calls, totalRanges } = await inOneTransaction(t, args, 5);
 		expect(totalRanges).toBeLessThanOrEqual(RANGE_LIMIT);
-		expect(calls.flatMap((call) => call.page.page.map((hit) => hit.matchedFields))).toEqual(
-			calls.flatMap((call) => call.page.page.map(() => ["memo"])),
-		);
+		expect(
+			calls.flatMap((call) => call.page.page.map((hit) => hit.matchedFields)),
+		).toEqual(calls.flatMap((call) => call.page.page.map(() => ["memo"])));
 		// Paging the rest across transactions loses nothing.
-		const memoHits = corpus().filter((entry) => entry.fields.memo.includes("TR-26"));
-		expect(await drain(t, args)).toEqual(memoHits.reverse().map((entry) => entry.key));
+		const memoHits = corpus().filter((entry) =>
+			entry.fields.memo.includes("TR-26"),
+		);
+		expect(await drain(t, args)).toEqual(
+			memoHits.reverse().map((entry) => entry.key),
+		);
 	}, 120_000);
 
 	test("a call that starts with little transaction headroom caps itself instead of overrunning", async () => {

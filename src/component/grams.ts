@@ -41,7 +41,10 @@ export function fold(text: string): string {
 }
 
 /** Codepoint-safe truncation (never splits a surrogate pair). */
-export function truncateCodepoints(text: string, maxCodepoints: number): string {
+export function truncateCodepoints(
+	text: string,
+	maxCodepoints: number,
+): string {
 	const codepoints = Array.from(text);
 	if (codepoints.length <= maxCodepoints) return text;
 	return codepoints.slice(0, maxCodepoints).join("");
@@ -76,12 +79,16 @@ export function queryGrams(foldedQuery: string): string[] {
 }
 
 /** Union of documentGrams over each field's folded text — grams never span field boundaries. */
-export function documentGramsOfFields(fields: Record<string, string>): Set<string> {
+export function documentGramsOfFields(
+	fields: Record<string, string>,
+): Set<string> {
 	return new Set(gramFieldsOf(fields).keys());
 }
 
 /** Each gram of the entry with the names of the Fields that contain it, sorted: a posting's `fields` tag. */
-export function gramFieldsOf(fields: Record<string, string>): Map<string, string[]> {
+export function gramFieldsOf(
+	fields: Record<string, string>,
+): Map<string, string[]> {
 	const tags = new Map<string, string[]>();
 	for (const name of Object.keys(fields).sort()) {
 		for (const gram of documentGrams(fields[name])) {

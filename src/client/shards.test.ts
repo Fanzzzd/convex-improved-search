@@ -53,7 +53,9 @@ function makeIndex() {
 
 async function drain(
 	index: ShardedSearchIndex,
-	ctx: { runQuery: (ref: unknown, args: Record<string, unknown>) => Promise<unknown> },
+	ctx: {
+		runQuery: (ref: unknown, args: Record<string, unknown>) => Promise<unknown>;
+	},
 	args: {
 		shards: readonly string[];
 		query: string;
@@ -188,7 +190,11 @@ describe("sharded search", () => {
 
 	test("passes fields to every shard", async () => {
 		const { ctx, calls } = makeCtx({});
-		await drain(makeIndex(), ctx, { shards: ["a", "b"], query: "x", fields: ["no"] });
+		await drain(makeIndex(), ctx, {
+			shards: ["a", "b"],
+			query: "x",
+			fields: ["no"],
+		});
 		expect(calls.map((call) => call.fields)).toEqual([["no"], ["no"]]);
 	});
 
@@ -208,7 +214,12 @@ describe("sharded search", () => {
 });
 
 describe("sharded trigger", () => {
-	type Doc = { _id: string; note: string; createdAt: number; archived?: boolean };
+	type Doc = {
+		_id: string;
+		note: string;
+		createdAt: number;
+		archived?: boolean;
+	};
 
 	function makeTrigger() {
 		const index = new ShardedSearchIndex(component, { name: "receipts" });
@@ -241,7 +252,10 @@ describe("sharded trigger", () => {
 			newDoc: doc,
 		});
 		expect(mutations).toHaveLength(1);
-		expect(mutations[0].args).toMatchObject({ namespace: "receipts/new", key: "r1" });
+		expect(mutations[0].args).toMatchObject({
+			namespace: "receipts/new",
+			key: "r1",
+		});
 	});
 
 	test("update within a shard is a single set", async () => {
@@ -285,7 +299,10 @@ describe("sharded trigger", () => {
 		});
 		expect(mutations).toHaveLength(1);
 		expect(mutations[0].ref).toBe(component.lib.remove);
-		expect(mutations[0].args).toMatchObject({ namespace: "receipts/old", key: "r1" });
+		expect(mutations[0].args).toMatchObject({
+			namespace: "receipts/old",
+			key: "r1",
+		});
 	});
 
 	test("archiving (mapper returns null) removes; archived docs never index", async () => {

@@ -1,8 +1,6 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": [
-    "typescript"
-  ],
+  "plugins": ["typescript"],
   "categories": {
     "correctness": "off"
   },
@@ -101,12 +99,7 @@
   },
   "overrides": [
     {
-      "files": [
-        "**/*.ts",
-        "**/*.tsx",
-        "**/*.mts",
-        "**/*.cts"
-      ],
+      "files": ["**/*.ts", "**/*.tsx", "**/*.mts", "**/*.cts"],
       "rules": {
         "constructor-super": "off",
         "getter-return": "off",
@@ -131,10 +124,7 @@
       }
     },
     {
-      "files": [
-        "src/**/*.{ts,tsx}",
-        "example/convex/**/*.{ts,tsx}"
-      ],
+      "files": ["src/**/*.{ts,tsx}", "example/convex/**/*.{ts,tsx}"],
       "rules": {
         "@convex-dev/import-wrong-runtime": "off",
         "@convex-dev/no-old-registered-function-syntax": "error",
@@ -160,18 +150,13 @@
         "typescript/no-floating-promises": "error",
         "typescript/no-explicit-any": "off"
       },
-      "jsPlugins": [
-        "@convex-dev/eslint-plugin"
-      ],
+      "jsPlugins": ["@convex-dev/eslint-plugin"],
       "env": {
         "worker": true
       }
     },
     {
-      "files": [
-        "src/react/**/*.{ts,tsx}",
-        "example/src/**/*.{ts,tsx}"
-      ],
+      "files": ["src/react/**/*.{ts,tsx}", "example/src/**/*.{ts,tsx}"],
       "rules": {
         "no-unused-vars": [
           "warn",
@@ -206,9 +191,7 @@
         "es2020": true,
         "browser": true
       },
-      "plugins": [
-        "react"
-      ]
+      "plugins": ["react"]
     }
   ]
 }

@@ -25,12 +25,16 @@ describe("example app", () => {
 		expect(workOnly.page.map((note) => note._id)).toEqual([a]);
 
 		await t.mutation(api.example.updateNote, { noteId: a, text: "改成過路費" });
-		const afterUpdate = await t.query(api.example.searchNotes, { query: "停車場" });
+		const afterUpdate = await t.query(api.example.searchNotes, {
+			query: "停車場",
+		});
 		expect(afterUpdate.page).toHaveLength(1);
 		const newText = await t.query(api.example.searchNotes, { query: "過路" });
 		expect(newText.page.map((note) => note._id)).toEqual([a]);
 
 		await t.mutation(api.example.deleteNote, { noteId: a });
-		expect((await t.query(api.example.searchNotes, { query: "過路" })).page).toEqual([]);
+		expect(
+			(await t.query(api.example.searchNotes, { query: "過路" })).page,
+		).toEqual([]);
 	});
 });

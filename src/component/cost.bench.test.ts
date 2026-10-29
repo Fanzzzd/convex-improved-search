@@ -17,7 +17,9 @@ import { api } from "./_generated/api.js";
 import { initConvexTest } from "./setup.test.js";
 import * as gramsModule from "./grams.js";
 
-const grams = gramsModule as typeof gramsModule & { gramFieldsOf?: typeof gramsModule.gramFieldsOf };
+const grams = gramsModule as typeof gramsModule & {
+	gramFieldsOf?: typeof gramsModule.gramFieldsOf;
+};
 const { fold } = grams;
 
 type T = ReturnType<typeof initConvexTest>;
@@ -39,7 +41,15 @@ type Page = {
 	cursor: string | null;
 	isDone: boolean;
 };
-type Cost = { calls: number; ranges: number; rows: number; maxCallRanges: number; maxCallRows: number; hits: number; done: boolean };
+type Cost = {
+	calls: number;
+	ranges: number;
+	rows: number;
+	maxCallRanges: number;
+	maxCallRows: number;
+	hits: number;
+	done: boolean;
+};
 
 const NS = "bench";
 
@@ -65,7 +75,11 @@ function documentNumbers(): Entry[] {
 			const no = `TR-${ymd}-${String(n).padStart(3, "0")}`;
 			entries.push({
 				key: no,
-				fields: { no, memo: sortKey % 97 === 0 ? "補單，原單 TR-260720-006" : "司機墊付停車費" },
+				fields: {
+					no,
+					memo:
+						sortKey % 97 === 0 ? "補單，原單 TR-260720-006" : "司機墊付停車費",
+				},
 				sortKey,
 			});
 		}
@@ -73,17 +87,38 @@ function documentNumbers(): Entry[] {
 	return entries;
 }
 
-const ALPHABET = ["停", "車", "費", "港", "a", "b", "A", "Ｂ", "１", "1", " ", "-", "̃", "😀", "\u{1D4B3}", "\u0001"];
+const ALPHABET = [
+	"停",
+	"車",
+	"費",
+	"港",
+	"a",
+	"b",
+	"A",
+	"Ｂ",
+	"１",
+	"1",
+	" ",
+	"-",
+	"̃",
+	"😀",
+	"\u{1D4B3}",
+	"\u0001",
+];
 function randomText(rand: () => number, max: number): string {
 	let text = "";
 	const length = Math.floor(rand() * (max + 1));
-	for (let i = 0; i < length; i++) text += ALPHABET[Math.floor(rand() * ALPHABET.length)];
+	for (let i = 0; i < length; i++)
+		text += ALPHABET[Math.floor(rand() * ALPHABET.length)];
 	return text;
 }
 function hostile(rand: () => number): Entry[] {
 	return Array.from({ length: 2000 }, (_, i): Entry => ({
 		key: `h${String(i).padStart(4, "0")}`,
-		fields: rand() < 0.5 ? { text: randomText(rand, 30) } : { a: randomText(rand, 15), b: randomText(rand, 15) },
+		fields:
+			rand() < 0.5
+				? { text: randomText(rand, 30) }
+				: { a: randomText(rand, 15), b: randomText(rand, 15) },
 		sortKey: Math.floor(rand() * 200),
 	}));
 }
@@ -91,11 +126,14 @@ function hostileQueries(rand: () => number, entries: Entry[]): string[] {
 	return Array.from({ length: 50 }, () => {
 		if (rand() < 0.5) {
 			const entry = entries[Math.floor(rand() * entries.length)];
-			const texts = Object.values(entry.fields).filter((text) => text.length > 0);
+			const texts = Object.values(entry.fields).filter(
+				(text) => text.length > 0,
+			);
 			if (texts.length > 0) {
 				const codepoints = Array.from(texts[Math.floor(rand() * texts.length)]);
 				const start = Math.floor(rand() * codepoints.length);
-				const length = 1 + Math.floor(rand() * Math.min(5, codepoints.length - start));
+				const length =
+					1 + Math.floor(rand() * Math.min(5, codepoints.length - start));
 				return codepoints.slice(start, start + length).join("");
 			}
 		}
@@ -115,7 +153,12 @@ function selectiveFilter(): Entry[] {
 async function seed(t: T, entries: Entry[]) {
 	await t.run(async (ctx) => {
 		for (const entry of entries) {
-			const fields = Object.fromEntries(Object.entries(entry.fields).map(([name, value]) => [name, fold(value)]));
+			const fields = Object.fromEntries(
+				Object.entries(entry.fields).map(([name, value]) => [
+					name,
+					fold(value),
+				]),
+			);
 			await ctx.db.insert("docs", {
 				namespace: NS,
 				key: entry.key,
@@ -125,7 +168,13 @@ async function seed(t: T, entries: Entry[]) {
 			});
 			// Builds before 0.5.0 have no posting tags (no gramFieldsOf).
 			const tagged: Map<string, string[] | undefined> =
-				grams.gramFieldsOf?.(fields) ?? new Map([...grams.documentGramsOfFields(fields)].map((gram) => [gram, undefined]));
+				grams.gramFieldsOf?.(fields) ??
+				new Map(
+					[...grams.documentGramsOfFields(fields)].map((gram) => [
+						gram,
+						undefined,
+					]),
+				);
 			for (const [gram, tag] of tagged) {
 				await ctx.db.insert("postings", {
 					namespace: NS,
@@ -143,8 +192,21 @@ async function seed(t: T, entries: Entry[]) {
 let fieldsSupported: boolean | null = null;
 
 /** Up to `maxCalls` searches; `perTransaction` puts them all in one transaction (the incident loop). */
-async function measure(t: T, args: Args, maxCalls: number, perTransaction: boolean): Promise<Cost> {
-	const cost: Cost = { calls: 0, ranges: 0, rows: 0, maxCallRanges: 0, maxCallRows: 0, hits: 0, done: false };
+async function measure(
+	t: T,
+	args: Args,
+	maxCalls: number,
+	perTransaction: boolean,
+): Promise<Cost> {
+	const cost: Cost = {
+		calls: 0,
+		ranges: 0,
+		rows: 0,
+		maxCallRanges: 0,
+		maxCallRows: 0,
+		hits: 0,
+		done: false,
+	};
 	let cursor: string | null = null;
 	const run = async (calls: number) =>
 		await t.run(async (ctx) => {
@@ -154,16 +216,26 @@ async function measure(t: T, args: Args, maxCalls: number, perTransaction: boole
 				let page: Page;
 				if (fields !== undefined && fieldsSupported !== false) {
 					try {
-						page = await ctx.runQuery(api.lib.search, { namespace: NS, ...rest, fields, cursor } as never);
+						page = await ctx.runQuery(api.lib.search, {
+							namespace: NS,
+							...rest,
+							fields,
+							cursor,
+						} as never);
 						fieldsSupported = true;
 					} catch (error) {
-						if (fieldsSupported === true || !String(error).includes("fields")) throw error;
+						if (fieldsSupported === true || !String(error).includes("fields"))
+							throw error;
 						fieldsSupported = false;
 						i -= 1;
 						continue;
 					}
 				} else {
-					page = await ctx.runQuery(api.lib.search, { namespace: NS, ...rest, cursor });
+					page = await ctx.runQuery(api.lib.search, {
+						namespace: NS,
+						...rest,
+						cursor,
+					});
 				}
 				const after = await ctx.meta.getTransactionMetrics();
 				const ranges = after.databaseQueries.used - before.databaseQueries.used;
@@ -171,7 +243,9 @@ async function measure(t: T, args: Args, maxCalls: number, perTransaction: boole
 				const hits =
 					fields === undefined || fieldsSupported
 						? page.page
-						: page.page.filter((hit) => hit.matchedFields.some((name) => fields.includes(name)));
+						: page.page.filter((hit) =>
+								hit.matchedFields.some((name) => fields.includes(name)),
+							);
 				cost.calls += 1;
 				cost.ranges += ranges;
 				cost.rows += rows;
@@ -193,64 +267,119 @@ async function measure(t: T, args: Args, maxCalls: number, perTransaction: boole
 function report(workload: string, cost: Cost) {
 	const line = JSON.stringify({ workload, ...cost });
 	console.log(`BENCH ${line}`);
-	if (process.env.CIS_BENCH_OUT) appendFileSync(process.env.CIS_BENCH_OUT, `${line}\n`);
+	if (process.env.CIS_BENCH_OUT)
+		appendFileSync(process.env.CIS_BENCH_OUT, `${line}\n`);
 }
 
-test.skipIf(!process.env.CIS_BENCH)("search read-cost benchmark", { timeout: 1_200_000 }, async () => {
-	const numbers = initConvexTest();
-	await seed(numbers, documentNumbers());
-	report("W1 TR-260720-006 drain", await measure(numbers, { query: "TR-260720-006", limit: 50 }, 500, false));
-	report(
-		"W2 TR-26 memo, 5 calls budget 512 in one transaction",
-		await measure(numbers, { query: "TR-26", fields: ["memo"], budget: 512, limit: 50 }, 5, true),
-	);
-	report("W3 停車 first page", await measure(numbers, { query: "停車", limit: 50 }, 1, false));
-	report("W4 0 first page", await measure(numbers, { query: "0", limit: 50 }, 1, false));
+test.skipIf(!process.env.CIS_BENCH)(
+	"search read-cost benchmark",
+	{ timeout: 1_200_000 },
+	async () => {
+		const numbers = initConvexTest();
+		await seed(numbers, documentNumbers());
+		report(
+			"W1 TR-260720-006 drain",
+			await measure(numbers, { query: "TR-260720-006", limit: 50 }, 500, false),
+		);
+		report(
+			"W2 TR-26 memo, 5 calls budget 512 in one transaction",
+			await measure(
+				numbers,
+				{ query: "TR-26", fields: ["memo"], budget: 512, limit: 50 },
+				5,
+				true,
+			),
+		);
+		report(
+			"W3 停車 first page",
+			await measure(numbers, { query: "停車", limit: 50 }, 1, false),
+		);
+		report(
+			"W4 0 first page",
+			await measure(numbers, { query: "0", limit: 50 }, 1, false),
+		);
 
-	const rand = prng(20261028);
-	const entries = hostile(rand);
-	const random = initConvexTest();
-	await seed(random, entries);
-	const total: Cost = { calls: 0, ranges: 0, rows: 0, maxCallRanges: 0, maxCallRows: 0, hits: 0, done: true };
-	for (const query of hostileQueries(rand, entries)) {
-		const cost = await measure(random, { query, limit: 50 }, 500, false);
-		expect(cost.done).toBe(true);
-		total.calls += cost.calls;
-		total.ranges += cost.ranges;
-		total.rows += cost.rows;
-		total.maxCallRanges = Math.max(total.maxCallRanges, cost.maxCallRanges);
-		total.maxCallRows = Math.max(total.maxCallRows, cost.maxCallRows);
-		total.hits += cost.hits;
-	}
-	report("W5 hostile corpus, 50 queries drained", total);
+		const rand = prng(20261028);
+		const entries = hostile(rand);
+		const random = initConvexTest();
+		await seed(random, entries);
+		const total: Cost = {
+			calls: 0,
+			ranges: 0,
+			rows: 0,
+			maxCallRanges: 0,
+			maxCallRows: 0,
+			hits: 0,
+			done: true,
+		};
+		for (const query of hostileQueries(rand, entries)) {
+			const cost = await measure(random, { query, limit: 50 }, 500, false);
+			expect(cost.done).toBe(true);
+			total.calls += cost.calls;
+			total.ranges += cost.ranges;
+			total.rows += cost.rows;
+			total.maxCallRanges = Math.max(total.maxCallRanges, cost.maxCallRanges);
+			total.maxCallRows = Math.max(total.maxCallRows, cost.maxCallRows);
+			total.hits += cost.hits;
+		}
+		report("W5 hostile corpus, 50 queries drained", total);
 
-	const filtered = initConvexTest();
-	await seed(filtered, selectiveFilter());
-	report("W6 停車 filter rare drain", await measure(filtered, { query: "停車", filters: { rare: true }, limit: 50 }, 500, false));
+		const filtered = initConvexTest();
+		await seed(filtered, selectiveFilter());
+		report(
+			"W6 停車 filter rare drain",
+			await measure(
+				filtered,
+				{ query: "停車", filters: { rare: true }, limit: 50 },
+				500,
+				false,
+			),
+		);
 
-	// Added by the round 1 judge.
-	report(
-		"W2' TR-26 memo drained, budget 512",
-		await measure(numbers, { query: "TR-26", fields: ["memo"], budget: 512, limit: 50 }, 500, false),
-	);
-	report(
-		"W7 TR-260720-006 no, 5 calls budget 512 in one transaction",
-		await measure(numbers, { query: "TR-260720-006", fields: ["no"], budget: 512, limit: 50 }, 5, true),
-	);
-	const tied = initConvexTest();
-	await seed(
-		tied,
-		Array.from({ length: 5000 }, (_, i) => ({
-			key: `k${String(i).padStart(5, "0")}`,
-			fields: { text: i % 50 === 0 ? "zabcxz" : `zabcz${i % 7}` },
-			sortKey: 0,
-		})),
-	);
-	report("W8 5000 tied sortKeys abcx drain", await measure(tied, { query: "abcx", limit: 50 }, 2000, false));
-	const negativeZero = initConvexTest();
-	await seed(
-		negativeZero,
-		Array.from({ length: 40 }, (_, i) => ({ key: `n${String(i).padStart(2, "0")}`, fields: { text: "停車費" }, sortKey: -0 })),
-	);
-	report("W9 sortKey -0 停車 drain limit 7", await measure(negativeZero, { query: "停車", limit: 7 }, 30, false));
-});
+		// Added by the round 1 judge.
+		report(
+			"W2' TR-26 memo drained, budget 512",
+			await measure(
+				numbers,
+				{ query: "TR-26", fields: ["memo"], budget: 512, limit: 50 },
+				500,
+				false,
+			),
+		);
+		report(
+			"W7 TR-260720-006 no, 5 calls budget 512 in one transaction",
+			await measure(
+				numbers,
+				{ query: "TR-260720-006", fields: ["no"], budget: 512, limit: 50 },
+				5,
+				true,
+			),
+		);
+		const tied = initConvexTest();
+		await seed(
+			tied,
+			Array.from({ length: 5000 }, (_, i) => ({
+				key: `k${String(i).padStart(5, "0")}`,
+				fields: { text: i % 50 === 0 ? "zabcxz" : `zabcz${i % 7}` },
+				sortKey: 0,
+			})),
+		);
+		report(
+			"W8 5000 tied sortKeys abcx drain",
+			await measure(tied, { query: "abcx", limit: 50 }, 2000, false),
+		);
+		const negativeZero = initConvexTest();
+		await seed(
+			negativeZero,
+			Array.from({ length: 40 }, (_, i) => ({
+				key: `n${String(i).padStart(2, "0")}`,
+				fields: { text: "停車費" },
+				sortKey: -0,
+			})),
+		);
+		report(
+			"W9 sortKey -0 停車 drain limit 7",
+			await measure(negativeZero, { query: "停車", limit: 7 }, 30, false),
+		);
+	},
+);

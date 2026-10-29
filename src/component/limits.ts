@@ -36,9 +36,15 @@ export function normalizeLimit(raw: number | undefined): number {
 	return Math.max(1, Math.min(Math.floor(raw ?? DEFAULT_LIMIT), MAX_LIMIT));
 }
 
-export function normalizeBudget(raw: number | undefined, limit: number): number {
+export function normalizeBudget(
+	raw: number | undefined,
+	limit: number,
+): number {
 	if (raw !== undefined && !Number.isFinite(raw)) {
 		throw new ConvexError("Search budget must be a finite number");
 	}
-	return Math.max(limit, Math.min(Math.floor(raw ?? DEFAULT_SCAN_BUDGET), MAX_SCAN_BUDGET));
+	return Math.max(
+		limit,
+		Math.min(Math.floor(raw ?? DEFAULT_SCAN_BUDGET), MAX_SCAN_BUDGET),
+	);
 }
