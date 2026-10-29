@@ -30,6 +30,7 @@ npm run verify:package
 npm run test
 npm run typecheck
 npm run lint
+npm run format:check
 npm pack --dry-run
 ```
 

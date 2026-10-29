@@ -394,6 +394,7 @@ npm run test        # randomized differential suites included
 CIS_BENCH=1 npx vitest run src/component/cost.bench.test.ts  # read-cost benchmark
 npm run typecheck
 npm run lint
+npm run format:check
 ```
 
 A runnable demo lives in [example/](./example/) — a Vite + React app.
