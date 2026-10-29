@@ -117,33 +117,61 @@ page 51 → 2 ranges, a 1 in 100 filter drained 3012 → 24, the hostile corpus
 
 Docs mode walks the docs alone and verifies each one. The docs stream holds
 every Entry, so this is the oracle itself and loses nothing; only the cost
-differs. It pays when most docs would be verified anyway: then the postings
-filter out too little to pay for their own rows.
+differs.
 
-Both directions judge one density: the share of docs passed that hold every
-sampled Gram (up to 16 query Grams) in one wanted Field. Postings mode counts it
-over the docs it verifies, per 32 verifications, and counts the docs a reopen
-jumped over as a full walk of 8. Docs mode counts it per window of 128 docs, or
-half the call's budget when that is smaller, so every call judges at least once.
-At half or more, a call in postings mode switches to docs; below half, a call in
-docs mode switches back.
+Each mode is judged by the load it puts on the transaction per doc passed: rows
+read times 4096/32000 plus bytes read times 4096/16 MiB, the shares of Convex's
+row and byte limits in range units. Ranges stay out of both sides. Docs mode
+reads one doc row per doc. Postings mode measures what it read since its last
+judgment: candidate and check postings, and the docs its walk read. Docs passed
+there is a lower bound, the docs the walk read plus one more walk for each
+reopen, and at least one doc per candidate. It switches to docs when its load
+per doc passed reaches a doc row's. It judges every 32 verifications or every
+window of docs passed, and only once every check has rejected a candidate (by
+position or by tags) or judged 16. Until then a check may still be dropped or
+swapped, and the plan it measures is not the one it will run. A check whose tags
+reject candidates is never dropped as idle.
 
-Leaving docs mode replans from the window: the Gram the fewest docs held
-streams, the next three check, and a Gram already streamed keeps its stream. The
-Cursor carries `d: 1` and no plan, so the next page starts in docs mode without
-a probe.
+Docs mode estimates what postings mode would read over a window of 128 docs, or
+half the call's budget when that is smaller. It counts the docs holding each
+sampled Gram (up to 16) in a wanted Field. The estimate adds the sparsest Gram's
+postings, each next Gram's postings up to 16 per candidate (a check's walk), and
+the docs walk to every doc holding all sampled Grams in one Field: from each, at
+most 8 docs back to the one before. When that is less than the window's doc
+rows, it leaves. A call that ends inside a window judges the docs it has, given
+16 of them, so a limit of 1 or a budget of 1 leaves docs mode too.
 
-Three earlier rules failed on the round 4 judge's workloads. Entering on all
-verified candidates, call-wide, re-entered right after each exit (W15, 停車 in
-the newest 300 docs then 1 in 50: 54 entries and 53 exits in 21 calls, 5450
-rows). Leaving on the candidate Gram alone never left when a check turned
-selective (W16: 34 pages, 6161 rows). Counting a reopen as 8 docs on top of the
-8 the walk read made the hostile corpus 4% dearer. Measured by the share of
-Convex's three read limits a workload uses (ranges/4096 + rows/32000 + bytes/16
-MiB), W15 fell by 62% and 63%, W16 by 75%, W12b (W12 with unique sortKeys) by
-75%, the incident query drained over 10k and 40k numbers by 46% and 59% (17 and
-93 calls down to 2 and 6), and the hostile corpus by 0.4%; a window of 64 docs
-left that one 3% dearer.
+Leaving replans from the window: the Gram the fewest docs held streams, the next
+three check, and a Gram already streamed keeps its stream. A call that leaves at
+its end writes that plan into the Cursor. A call that ends in docs mode writes
+`d: 1` and no plan, so the next page starts there without a probe.
+
+Earlier rules failed on the round 4 and 5 judges' workloads:
+
+- Entering on the share of verified docs that hold every sampled Gram: W22 (停車
+  and 車費 in separate Fields of every doc) never entered, yet postings read two
+  rows per doc against one. L 1035 → 2014.
+- Judging only after a full window: a page that ended first kept `d: 1` for
+  good. W20b at budget 1 took 11601 calls instead of 117.
+- Measuring a plan whose checks had not shown what they do: W1 entered docs mode
+  on checks that would have been dropped. L +25%.
+- Charging the docs walk as 8 docs per dense doc, spread evenly: W20 at limit 2
+  left a dense stretch one window late. L +6%.
+- A window of 96 docs or less: the incident corpus holds `7-` in runs of 100
+  docs, and a window inside a run misjudges it. W19 `07-2607` at 5000 numbers
+  +18%.
+
+Against 4c9bea6, measured by L (ranges + rows·4096/32000 + bytes·4096/16 MiB):
+
+| Workload                          | Change in L  |
+| --------------------------------- | ------------ |
+| W15, W16, W12b                    | −62% to −75% |
+| W17 / W18                         | −50% / −38%  |
+| W20, limits 5 / 50                | −74% / −75%  |
+| W21                               | −13% to −16% |
+| Incident query, 10k / 40k numbers | −46% / −66%  |
+| No-hit query, 10k / 40k numbers   | −14% / −33%  |
+| Every other workload              | −4% to +2%   |
 
 ## Headroom
 

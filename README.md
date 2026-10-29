@@ -356,17 +356,21 @@ cost; paging naturally continues into older shards (same cursor contract as
   the sparsest, and merge-joins the next three against it, so a rejected
   candidate costs streamed rows, not index ranges. Surviving candidates are
   checked against their documents, read by walking the documents in the same
-  order: dense hits cost rows, and a far-apart hit costs one index range. The
-  cursor carries the chosen grams, so the next page skips probing. `budget` caps
-  the candidates checked per call (default 256, max 768). Every call in one
-  transaction shares Convex's limits (4096 index ranges, 32000 rows, 16 MiB
-  read, and 15 s of total database time) with your own reads and with every
-  other `search` in it. Each call checks what the transaction has left, keeps
-  512 ranges, 4096 rows and 2 MiB for you, and otherwise returns a short page
-  with a cursor. The 15 s limit cannot be measured from inside the query, so the
-  reserve does not cover it. Calling `search` in a loop inside one query
-  therefore adds up; use `fill: true` and `fields` instead, and page further
-  from the client.
+  order: dense hits cost rows, and a far-apart hit costs one index range. When
+  the postings and documents read come to as much per document as reading every
+  document would (a dense query, or grams split across fields), the call walks
+  the documents alone instead: about one row, text included, per document
+  passed. It switches back once the grams thin out. The cursor carries the
+  chosen grams, or that it was walking documents, so the next page skips
+  probing. `budget` caps the documents checked per call (default 256, max 768).
+  Every call in one transaction shares Convex's limits (4096 index ranges, 32000
+  rows, 16 MiB read, and 15 s of total database time) with your own reads and
+  with every other `search` in it. Each call checks what the transaction has
+  left, keeps 512 ranges, 4096 rows and 2 MiB for you, and otherwise returns a
+  short page with a cursor. The 15 s limit cannot be measured from inside the
+  query, so the reserve does not cover it. Calling `search` in a loop inside one
+  query therefore adds up; use `fill: true` and `fields` instead, and page
+  further from the client.
 - **Exact identifiers**: to look up a whole document number, an equality index
   on your own table answers in one index range. Substring search is for partial
   numbers and free text.

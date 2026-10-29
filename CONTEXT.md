@@ -51,10 +51,10 @@ during Verification. An absent field matches nothing; `null` is a real value.
 _Avoid_: facet, tag
 
 **Scan Budget**: The maximum number of docs one `search` call may verify: the
-candidates that survive the Check Grams, or, when candidates are dense, every
-doc it walks. A call also stops early when its transaction runs low, since every
-call in a transaction shares one set of limits. Exhausting either ends the call,
-never the search.
+candidates that survive the Check Grams, or, when walking the docs alone reads
+less, every doc it walks. A call also stops early when its transaction runs low,
+since every call in a transaction shares one set of limits. Exhausting either
+ends the call, never the search.
 
 **Check Gram**: A query Gram streamed alongside the candidate stream and
 merge-joined against it, so a candidate missing the Gram is rejected without a

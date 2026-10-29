@@ -72,20 +72,23 @@ type Drained = {
 	calls: number;
 	maxCallRanges: number;
 	maxCallRows: number;
+	rows: number;
 };
 
 async function drain(
 	t: T,
 	args: { query: string; limit: number; budget?: number; fields?: string[] },
 	maxCalls = 2000,
+	start: string | null = null,
 ): Promise<Drained> {
 	const drained: Drained = {
 		hits: [],
 		calls: 0,
 		maxCallRanges: 0,
 		maxCallRows: 0,
+		rows: 0,
 	};
-	let cursor: string | null = null;
+	let cursor = start;
 	for (let i = 0; i < maxCalls; i++) {
 		const done = await t.run(async (ctx) => {
 			const before = await ctx.meta.getTransactionMetrics();
@@ -96,6 +99,7 @@ async function drain(
 			});
 			const after = await ctx.meta.getTransactionMetrics();
 			drained.calls += 1;
+			drained.rows += after.documentsRead.used - before.documentsRead.used;
 			drained.maxCallRanges = Math.max(
 				drained.maxCallRanges,
 				after.databaseQueries.used - before.databaseQueries.used,
@@ -369,6 +373,61 @@ describe("search over a messy index", () => {
 				return after.documentsRead.used - before.documentsRead.used;
 			});
 			expect(rows).toBeLessThan(2500);
+		},
+	);
+
+	test(
+		"pages that end before a full window still leave docs mode",
+		{ timeout: 600_000 },
+		async () => {
+			// The newest 400 hold every gram of 停車費 apart; after them 停車費
+			// is in 1 of 100 docs that hold no query gram. Paging from a docs
+			// mode cursor with limit 1 ends every page long before a window
+			// of 128 docs, and budget 1 after a single doc.
+			const entries = Array.from({ length: 3000 }, (_, i) => ({
+				key: `w${String(i).padStart(5, "0")}`,
+				fields: {
+					text: i < 400 ? "停車 車費" : i % 100 === 0 ? "停車費" : "雜項",
+				},
+				sortKey: 3000 - i,
+			}));
+			const t = initConvexTest();
+			await seed(t, entries);
+			const inDocsMode = JSON.stringify({ s: 3000 - 399, k: "w00399", d: 1 });
+			const expected = oracle(entries.slice(400), "停車費");
+			for (const budget of [1, undefined]) {
+				const drained = await drain(
+					t,
+					{ query: "停車費", limit: 1, budget },
+					2000,
+					inDocsMode,
+				);
+				expect(drained.hits, `budget ${budget}`).toEqual(expected);
+				// Staying in docs mode reads all 2600 docs, one page per doc at budget 1.
+				expect(drained.calls, `budget ${budget}`).toBeLessThan(40);
+				expect(drained.rows, `budget ${budget}`).toBeLessThan(800);
+			}
+		},
+	);
+
+	test(
+		"grams split across fields cost about one row per doc",
+		{ timeout: 600_000 },
+		async () => {
+			// Every doc holds 停車 in one Field and 車費 in the other, so tags
+			// reject nearly every candidate, yet both posting streams cost a row
+			// per doc. Walking the docs alone costs one.
+			const entries = Array.from({ length: 3000 }, (_, i) => ({
+				key: `s${String(i).padStart(5, "0")}`,
+				fields:
+					i % 50 === 0 ? { a: "停車費", b: "x" } : { a: "停車 x", b: "車費 y" },
+				sortKey: 3000 - i,
+			}));
+			const t = initConvexTest();
+			await seed(t, entries);
+			const drained = await drain(t, { query: "停車費", limit: 50 });
+			expect(drained.hits).toEqual(oracle(entries, "停車費"));
+			expect(drained.rows).toBeLessThan(4500);
 		},
 	);
 
