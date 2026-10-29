@@ -332,6 +332,47 @@ describe("search over a messy index", () => {
 	);
 
 	test(
+		"a small budget still leaves docs mode once candidates thin out",
+		{ timeout: 600_000 },
+		async () => {
+			// The newest 1000 hold every gram of 停車費 but never match it, so a
+			// call walks them in docs mode with nothing to fill its page. The
+			// older 3000 hold 車費 1 in 100. A judgment window wider than the
+			// budget would keep every later call in docs mode.
+			const entries = Array.from({ length: 4000 }, (_, i) => ({
+				key: `s${String(i).padStart(5, "0")}`,
+				fields: {
+					text: i < 1000 ? "停車車費" : i % 100 === 0 ? "停車費" : "停車位",
+				},
+				sortKey: 4000 - i,
+			}));
+			const t = initConvexTest();
+			await seed(t, entries);
+			const args = { query: "停車費", limit: 5, budget: 100 };
+			const drained = await drain(t, args);
+			expect(drained.hits).toEqual(oracle(entries, "停車費"));
+			// Walking every doc alone would read about 4000 rows.
+			const rows = await t.run(async (ctx) => {
+				const before = await ctx.meta.getTransactionMetrics();
+				let cursor: string | null = null;
+				for (let done = false; !done;) {
+					const page: { isDone: boolean; cursor: string | null } =
+						await ctx.runQuery(api.lib.search, {
+							namespace: NS,
+							...args,
+							cursor,
+						});
+					done = page.isDone;
+					cursor = page.cursor;
+				}
+				const after = await ctx.meta.getTransactionMetrics();
+				return after.documentsRead.used - before.documentsRead.used;
+			});
+			expect(rows).toBeLessThan(2500);
+		},
+	);
+
+	test(
 		"a large tie group costs each call a bounded number of rows",
 		{ timeout: 600_000 },
 		async () => {

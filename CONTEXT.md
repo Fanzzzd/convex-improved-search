@@ -50,10 +50,11 @@ Typically a creation timestamp.
 during Verification. An absent field matches nothing; `null` is a real value.
 _Avoid_: facet, tag
 
-**Scan Budget**: The maximum number of candidates one `search` call may verify.
-A call also stops early when its transaction runs low, since every call in a
-transaction shares one set of limits. Exhausting either ends the call, never the
-search.
+**Scan Budget**: The maximum number of docs one `search` call may verify: the
+candidates that survive the Check Grams, or, when candidates are dense, every
+doc it walks. A call also stops early when its transaction runs low, since every
+call in a transaction shares one set of limits. Exhausting either ends the call,
+never the search.
 
 **Check Gram**: A query Gram streamed alongside the candidate stream and
 merge-joined against it, so a candidate missing the Gram is rejected without a
@@ -68,8 +69,9 @@ ran out, not that matches ran out.
 **Cursor**: The resumption token covering everything already scanned. Feeding it
 back continues the search exactly where it stopped.
 
-**Done**: The terminal search state (`isDone: true`): every Posting stream is
-exhausted. The only signal that no further matches exist.
+**Done**: The terminal search state (`isDone: true`): the stream the call was
+walking (the candidate Postings, or the docs) has no rows left after the Cursor.
+The only signal that no further matches exist.
 
 **Reaper**: The component-internal scheduled mutation (`reapKey`) that
 asynchronously deletes an Entry's stale Postings and repairs duplicates and

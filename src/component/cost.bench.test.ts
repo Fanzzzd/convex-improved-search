@@ -47,6 +47,8 @@ type Cost = {
 	rows: number;
 	maxCallRanges: number;
 	maxCallRows: number;
+	bytes: number;
+	maxCallBytes: number;
 	hits: number;
 	done: boolean;
 };
@@ -204,6 +206,8 @@ async function measure(
 		rows: 0,
 		maxCallRanges: 0,
 		maxCallRows: 0,
+		bytes: 0,
+		maxCallBytes: 0,
 		hits: 0,
 		done: false,
 	};
@@ -240,6 +244,7 @@ async function measure(
 				const after = await ctx.meta.getTransactionMetrics();
 				const ranges = after.databaseQueries.used - before.databaseQueries.used;
 				const rows = after.documentsRead.used - before.documentsRead.used;
+				const bytes = after.bytesRead.used - before.bytesRead.used;
 				const hits =
 					fields === undefined || fieldsSupported
 						? page.page
@@ -251,6 +256,8 @@ async function measure(
 				cost.rows += rows;
 				cost.maxCallRanges = Math.max(cost.maxCallRanges, ranges);
 				cost.maxCallRows = Math.max(cost.maxCallRows, rows);
+				cost.bytes += bytes;
+				cost.maxCallBytes = Math.max(cost.maxCallBytes, bytes);
 				cost.hits += hits.length;
 				cost.done = page.isDone;
 				cursor = page.cursor;
@@ -309,6 +316,8 @@ test.skipIf(!process.env.CIS_BENCH)(
 			rows: 0,
 			maxCallRanges: 0,
 			maxCallRows: 0,
+			bytes: 0,
+			maxCallBytes: 0,
 			hits: 0,
 			done: true,
 		};
@@ -320,6 +329,8 @@ test.skipIf(!process.env.CIS_BENCH)(
 			total.rows += cost.rows;
 			total.maxCallRanges = Math.max(total.maxCallRanges, cost.maxCallRanges);
 			total.maxCallRows = Math.max(total.maxCallRows, cost.maxCallRows);
+			total.bytes += cost.bytes;
+			total.maxCallBytes = Math.max(total.maxCallBytes, cost.maxCallBytes);
 			total.hits += cost.hits;
 		}
 		report("W5 hostile corpus, 50 queries drained", total);

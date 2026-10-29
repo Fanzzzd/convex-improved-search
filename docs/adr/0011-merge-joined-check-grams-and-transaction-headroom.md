@@ -68,7 +68,8 @@ been walked to the current candidate. Every match holds both Grams and the check
 stream has no unhandled row above its head, so the swap loses nothing. W14 (a
 probe that misjudges the candidate Gram) costs 83 ranges / 1314 rows; without
 the swap a carried plan kept the wrong candidate until the call's row cap, 87
-/ 5063.
+/ 5063. A Gram may swap back: on W7 the second swap saves rows (899 against 1562
+when a swapped-out Gram stays out).
 
 The Cursor carries the plan (candidate Gram, then the Check Grams still in use)
 as `g`, so the next page skips probing, unless a check still rejects most of
@@ -114,15 +115,35 @@ page 51 → 2 ranges, a 1 in 100 filter drained 3012 → 24, the hostile corpus
 
 ## Docs alone
 
-When at least half the docs a call has walked were verified candidates (after
-32), the postings filter out too little to pay for their own rows. The call then
-walks the docs alone and verifies each one; the docs stream holds every Entry,
-so this is the oracle itself and loses nothing. It reads the candidate density
-off the docs (how many hold the candidate Gram), and returns to postings when
-fewer than half of 64 do. The Cursor carries `d: 1` so the next page starts in
-docs mode. The hostile corpus fell from 3217 ranges / 131798 rows to 2466 /
-80980 (0.4.0: 92230 rows), the 1 in 100 filter from 24 / 6011 to 13 / 3043, W11
-from 45 / 7890 to 31 / 4176.
+Docs mode walks the docs alone and verifies each one. The docs stream holds
+every Entry, so this is the oracle itself and loses nothing; only the cost
+differs. It pays when most docs would be verified anyway: then the postings
+filter out too little to pay for their own rows.
+
+Both directions judge one density: the share of docs passed that hold every
+sampled Gram (up to 16 query Grams) in one wanted Field. Postings mode counts it
+over the docs it verifies, per 32 verifications, and counts the docs a reopen
+jumped over as a full walk of 8. Docs mode counts it per window of 128 docs, or
+half the call's budget when that is smaller, so every call judges at least once.
+At half or more, a call in postings mode switches to docs; below half, a call in
+docs mode switches back.
+
+Leaving docs mode replans from the window: the Gram the fewest docs held
+streams, the next three check, and a Gram already streamed keeps its stream. The
+Cursor carries `d: 1` and no plan, so the next page starts in docs mode without
+a probe.
+
+Three earlier rules failed on the round 4 judge's workloads. Entering on all
+verified candidates, call-wide, re-entered right after each exit (W15, 停車 in
+the newest 300 docs then 1 in 50: 54 entries and 53 exits in 21 calls, 5450
+rows). Leaving on the candidate Gram alone never left when a check turned
+selective (W16: 34 pages, 6161 rows). Counting a reopen as 8 docs on top of the
+8 the walk read made the hostile corpus 4% dearer. Measured by the share of
+Convex's three read limits a workload uses (ranges/4096 + rows/32000 + bytes/16
+MiB), W15 fell by 62% and 63%, W16 by 75%, W12b (W12 with unique sortKeys) by
+75%, the incident query drained over 10k and 40k numbers by 46% and 59% (17 and
+93 calls down to 2 and 6), and the hostile corpus by 0.4%; a window of 64 docs
+left that one 3% dearer.
 
 ## Headroom
 

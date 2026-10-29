@@ -380,6 +380,8 @@ class SortedStream<Row extends Position> {
 	/** Ranges this stream has opened, and rows it has read. */
 	opened = 0;
 	read = 0;
+	/** Rows a reopen jumped over that its walk had not read, counting each reopen as a full walk. */
+	skipped = 0;
 	/** Set when every row at this sortKey or above is behind the stream and the rest is unopened. */
 	private below: number | null = null;
 	/** The sortKey the open range is confined to, when it is an exact (tie group) range. */
@@ -424,6 +426,7 @@ class SortedStream<Row extends Position> {
 			if (this.current === null || !beyond(this.current)) return true;
 			if ((walked >= walk || walkedBytes >= WALK_BYTES) && stage !== "exact") {
 				if (!reopen) return true;
+				this.skipped += Math.max(0, walk - walked);
 				walked = 0;
 				walkedBytes = 0;
 				const inTieGroup =
@@ -513,8 +516,11 @@ const IDLE_CHECK_JUDGMENTS = 64;
 const MISJUDGED_AFTER = 16;
 /** Verified candidates before a call judges whether walking docs alone is cheaper. */
 const DENSE_AFTER = 32;
-/** Docs walked alone before a call judges whether candidates have thinned out. */
-const SPARSE_AFTER = 64;
+/**
+ * Docs walked alone per judgment of whether candidates have thinned out, at
+ * most half the call's budget so every call judges at least once.
+ */
+const SPARSE_AFTER = 128;
 
 /** A check that rejects most of what it judges is sparser than the candidate gram. */
 function isMisjudged(check: Check): boolean {
@@ -652,6 +658,9 @@ export const search = query({
 		} else if (grams.length === 1) {
 			// One gram (two codepoints, or "aaa"): nothing to rank, stream it.
 			of = { gram: grams[0] };
+		} else if (cursor?.d === 1) {
+			// Docs mode needs no plan: leaving it plans from the docs it read.
+			of = { gram: grams[0] };
 		} else if (
 			cursor?.g !== undefined &&
 			cursor.g.every((gram) => grams.includes(gram))
@@ -673,7 +682,10 @@ export const search = query({
 				MIN_STREAM_ROWS,
 				Math.min(budget * ROWS_PER_CANDIDATE, MAX_STREAM_ROWS, headroom.rows),
 			),
-			Math.min(budget * (1 + checkGrams.length), headroom.ranges - 1),
+			Math.min(
+				budget * (1 + Math.min(CHECK_GRAMS, Math.max(0, grams.length - 1))),
+				headroom.ranges - 1,
+			),
 			headroom.bytes,
 		);
 		const streamOf = (stream: StreamOf) =>
@@ -731,9 +743,18 @@ export const search = query({
 		// survivors against docs walked in step. Docs: when candidates are
 		// dense, walk the docs alone and verify each one. The docs stream holds
 		// every Entry, so docs mode is the oracle itself; only the cost differs.
-		let docsOnly =
-			cursor?.d === 1 && (grams.length <= 1 || cursor.g !== undefined);
+		let docsOnly = cursor?.d === 1;
 		let more = true;
+		// Docs mode reads each Entry's text, so it measures what a probe
+		// guesses: how many docs hold each gram (in a wanted Field).
+		const sampled =
+			codepointCount === 1 ? [folded] : spread(grams, MAX_PROBE_GRAMS);
+		// Docs that postings mode walked or jumped over.
+		const docsPassed = () => docs.read + docs.skipped;
+		// Verified docs that hold every sampled gram: what docs mode would find
+		// dense. Entry and exit judge the same density.
+		let full = 0;
+		let since = { verified: 0, full: 0, docs: 0 };
 		const resumeAt = (): Position | null =>
 			last !== null
 				? { sortKey: last.s, key: last.k }
@@ -748,11 +769,12 @@ export const search = query({
 						must: last === null,
 						walk: RESUME_ROWS,
 					})) && (await docs.land(last === null));
-				// Candidate density, read off the docs themselves: how many hold the
-				// candidate gram (or codepoint), so would have been candidates.
-				const needle = "gram" in of ? of.gram : of.g1;
+				// Per window of docs: how many hold each sampled gram, and how many
+				// hold all of them (the candidates a good plan would still verify).
+				const span = Math.min(SPARSE_AFTER, Math.ceil(budget / 2));
 				let seen = 0;
 				let dense = 0;
+				const held = sampled.map(() => 0);
 				while (more) {
 					const doc = docs.head;
 					if (doc === null) break;
@@ -760,8 +782,10 @@ export const search = query({
 					examined += 1;
 					verified += 1;
 					seen += 1;
-					if (Object.values(doc.fields).some((text) => text.includes(needle)))
-						dense += 1;
+					sampled.forEach((gram, i) => {
+						if (holds(doc, [gram], fieldNames)) held[i] += 1;
+					});
+					if (holds(doc, sampled, fieldNames)) dense += 1;
 					const matchedFields = verifyCandidate(
 						doc,
 						wantedFilters,
@@ -774,9 +798,39 @@ export const search = query({
 						exhausted = false;
 						break modes;
 					}
-					if (seen >= SPARSE_AFTER && dense * 2 < seen) {
-						docsOnly = false;
-						continue modes;
+					if (seen >= span) {
+						if (dense * 2 < seen) {
+							// Back to postings with a plan from these docs: the sparsest
+							// gram here streams, the next ones check. A gram already
+							// streamed keeps its stream (its next seek walks or reopens);
+							// none holds an unhandled row above its head, as for a swap.
+							docsOnly = false;
+							if ("gram" in of) {
+								const open = new Map(
+									checks.map((check) => [check.gram, check.stream]),
+								);
+								open.set(of.gram, candidates);
+								const streamFor = (gram: string) =>
+									open.get(gram) ?? streamOf({ gram });
+								const ranked = sampled
+									.map((gram, i) => ({ gram, held: held[i] }))
+									.sort((a, b) => a.held - b.held);
+								of = { gram: ranked[0].gram };
+								candidates = streamFor(of.gram);
+								checks.splice(
+									0,
+									checks.length,
+									...ranked
+										.slice(1, 1 + CHECK_GRAMS)
+										.map(({ gram }) => checkOf(gram, streamFor(gram))),
+								);
+							}
+							since = { verified, full, docs: docsPassed() };
+							continue modes;
+						}
+						seen = 0;
+						dense = 0;
+						held.fill(0);
 					}
 					more = await docs.next();
 				}
@@ -839,6 +893,7 @@ export const search = query({
 						docs.head !== null && comparePositions(docs.head, posting) === 0
 							? docs.head
 							: null;
+					if (doc !== null && holds(doc, sampled, fieldNames)) full += 1;
 					const matchedFields = verifyCandidate(
 						doc,
 						wantedFilters,
@@ -884,12 +939,17 @@ export const search = query({
 					more = await candidates.land(false);
 					continue;
 				}
-				// When at least half the docs walked were verified candidates, the
-				// postings filter out too little to pay for their own rows: walk
-				// the docs alone from here and verify each one.
-				if (verified >= DENSE_AFTER && verified * 2 >= docs.read) {
-					docsOnly = true;
-					continue modes;
+				// When at least half the docs passed since the last judgment hold
+				// every sampled gram, the postings filter out too little to pay for
+				// their own rows: walk the docs alone from here and verify
+				// each one. Judged per DENSE_AFTER verifications, so a dense stretch
+				// counts only while it lasts.
+				if (verified - since.verified >= DENSE_AFTER) {
+					if ((full - since.full) * 2 >= docsPassed() - since.docs) {
+						docsOnly = true;
+						continue modes;
+					}
+					since = { verified, full, docs: docsPassed() };
 				}
 				more = await candidates.next();
 			}
@@ -899,14 +959,13 @@ export const search = query({
 
 		// Carry the plan forward, minus dropped checks, unless a check still
 		// rejects most of what it judges (the next page probes again). A call
-		// that ended in docs mode tells the next one to start there.
-		const misjudged = !docsOnly && checks.some(isMisjudged);
-		const plan = {
-			...("gram" in of && grams.length > 1 && !misjudged
+		// that ended in docs mode tells the next one to start there, and
+		// needs no plan.
+		const plan = docsOnly
+			? { d: 1 as const }
+			: "gram" in of && grams.length > 1 && !checks.some(isMisjudged)
 				? { g: [of.gram, ...checks.map((check) => check.gram)] }
-				: {}),
-			...(docsOnly ? { d: 1 as const } : {}),
-		};
+				: {};
 		return {
 			page,
 			cursor:
@@ -917,6 +976,19 @@ export const search = query({
 		};
 	},
 });
+
+/** Whether one wanted Field of the doc holds every one of `grams`. */
+function holds(
+	doc: Doc<"docs">,
+	grams: string[],
+	fieldNames: Set<string> | null,
+): boolean {
+	return Object.entries(doc.fields).some(
+		([name, text]) =>
+			(fieldNames === null || fieldNames.has(name)) &&
+			grams.every((gram) => text.includes(gram)),
+	);
+}
 
 /** The candidate's matched field names when it truly matches, else null. */
 function verifyCandidate(

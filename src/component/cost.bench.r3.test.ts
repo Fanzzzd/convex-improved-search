@@ -179,3 +179,123 @@ test.skipIf(!process.env.CIS_BENCH)(
 		);
 	},
 );
+
+/**
+ * Round 4 judge workloads:
+ *  W15: 6300 docs of ~140 codepoints; the newest 300 hold 停車 (half
+ *       停車場), the rest 1 in 50. 停車場 and 停車 drained: docs mode must
+ *       hand back to postings when candidates thin out.
+ *  W16: 6000 docs; 停車 in every one; 停車費 in the newest 600, then 1 in
+ *       100. 停車費 drained: the candidate gram stays dense while a check
+ *       turns selective.
+ *  W12b: W12 with unique sortKeys (no tie group).
+ *  W17: two independent grams in half the docs each; abc in 1 in 10 of
+ *       docs holding both. Guards swap oscillation.
+ *  W18: ab in 1 of 10, bc in every doc, abc in 1 of 100. Guards a check
+ *       that keeps falling behind.
+ */
+test.skipIf(!process.env.CIS_BENCH)(
+	"round 4 judge workloads W15 W16 W12b W17 W18",
+	{ timeout: 3_600_000 },
+	async () => {
+		const denseThenSparse = initConvexTest();
+		const filler15 = "過磅單司機墊付".repeat(20);
+		await seed(
+			denseThenSparse,
+			Array.from({ length: 6300 }, (_, i) => {
+				const holds = i < 300 || i % 50 === 0;
+				const text = holds ? (i % 2 === 0 ? "停車場月租" : "停車費") : "雜項";
+				return {
+					key: `w${String(i).padStart(5, "0")}`,
+					fields: { text: text + filler15 },
+					sortKey: 6300 - i,
+				};
+			}),
+		);
+		for (const query of ["停車場", "停車"]) {
+			report(
+				`W15 dense then sparse, ${query} drained`,
+				await drain(denseThenSparse, { query, limit: 50 }, 2000),
+			);
+		}
+
+		const checkTurns = initConvexTest();
+		const filler16 = "司機墊付".repeat(40);
+		await seed(
+			checkTurns,
+			Array.from({ length: 6000 }, (_, i) => ({
+				key: `v${String(i).padStart(5, "0")}`,
+				fields: {
+					text: (i < 600 || i % 100 === 0 ? "停車費" : "停車位") + filler16,
+				},
+				sortKey: 6000 - i,
+			})),
+		);
+		report(
+			"W16 check turns selective, 停車費 drained",
+			await drain(checkTurns, { query: "停車費", limit: 50 }, 2000),
+		);
+
+		const big = initConvexTest();
+		const filler = "😀".repeat(4088);
+		await seed(
+			big,
+			Array.from({ length: 1200 }, (_, i) => ({
+				key: `m${String(i).padStart(4, "0")}`,
+				fields: { text: filler + (i % 25 === 0 ? "qz" : "qq") + "ab bc" },
+				sortKey: i,
+			})),
+		);
+		report(
+			"W12b max-size docs, unique sortKeys, qz drained",
+			await drain(big, { query: "qz", limit: 200, budget: 768 }, 500),
+		);
+
+		let a = 777;
+		const rand = () => {
+			a = (a + 0x6d2b79f5) >>> 0;
+			let t = a;
+			t = Math.imul(t ^ (t >>> 15), t | 1);
+			t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+			return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+		};
+		const halfDense = initConvexTest();
+		await seed(
+			halfDense,
+			Array.from({ length: 4000 }, (_, i) => {
+				const ab = rand() < 0.5;
+				const bc = rand() < 0.5;
+				return {
+					key: `o${String(i).padStart(5, "0")}`,
+					fields: {
+						text:
+							(ab ? "xab " : "x ") +
+							(bc ? "ybc " : "y ") +
+							(ab && bc && rand() < 0.1 ? "abc" : ""),
+					},
+					sortKey: 4000 - i,
+				};
+			}),
+		);
+		report(
+			"W17 two half-dense grams, abc drained",
+			await drain(halfDense, { query: "abc", limit: 50 }, 2000),
+		);
+
+		const behind = initConvexTest();
+		await seed(
+			behind,
+			Array.from({ length: 6000 }, (_, i) => ({
+				key: `b${String(i).padStart(5, "0")}`,
+				fields: {
+					text: (i % 10 === 0 ? (i % 100 === 0 ? "abc" : "ab") : "x") + " bc",
+				},
+				sortKey: 6000 - i,
+			})),
+		);
+		report(
+			"W18 check keeps falling behind, abc drained",
+			await drain(behind, { query: "abc", limit: 50 }, 2000),
+		);
+	},
+);
