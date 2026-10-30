@@ -42,6 +42,13 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         } | null,
         Name
       >;
+      namespaceBefore: FunctionReference<
+        "query",
+        "internal",
+        { before?: string; prefix: string },
+        string | null,
+        Name
+      >;
       remove: FunctionReference<
         "mutation",
         "internal",

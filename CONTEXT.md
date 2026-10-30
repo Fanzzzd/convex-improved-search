@@ -84,7 +84,9 @@ them. _Avoid_: garbage collector, compaction
 `${name}/${shard}` — typically a time slice like `receipts/2026Q3` whose Sort
 Key range is disjoint from every other Shard's. The component has no notion of
 Shards; sequential per-Shard search yields globally sorted results because the
-ranges are disjoint. _Avoid_: partition, bucket
+ranges are disjoint. A **dated** Shard is named by the UTC period (month,
+quarter, year) of its Sort Key, so the client derives it and finds the Shards
+without a list. _Avoid_: partition, bucket
 
 **Indexer**: (client vocabulary) A `TableIndexer`: one table, one mapper from
 document to Entry (or `null` for "keep out"), from which every sync path derives

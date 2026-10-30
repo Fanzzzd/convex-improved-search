@@ -266,41 +266,62 @@ do {
 
 ### Scaling out: time shards
 
-Past ~100k entries per namespace, partition by time with `ShardedSearchIndex` —
-one namespace per shard (`receipts/2026Q3`), created lazily on first write,
-pre-indexable ahead of a cutover with the ordinary backfill recipe, droppable
-per shard via `clear`:
+Past ~100k entries per namespace, partition by time with `ShardedSearchIndex`.
+Each shard is its own namespace (`receipts/2026Q3`). It is created on its first
+write, can be indexed ahead of a cutover with the ordinary backfill recipe, and
+can be dropped with `clear`.
+
+With a `period` (`"month"`, `"quarter"` or `"year"`), the shard comes from the
+`sortKey`, which must be a timestamp in ms. Periods are in UTC.
 
 ```ts
 export const receipts = new ShardedSearchIndex(components.improvedSearch, {
   name: "receipts",
+  period: "quarter",
   filterFields: ["source"],
 });
-const shardOf = (createdAt: number) => {
-  const d = new Date(createdAt);
-  return `${d.getUTCFullYear()}Q${Math.floor(d.getUTCMonth() / 3) + 1}`;
-};
 
 // Writes (or receipts.trigger((ctx, doc) => …) with the same shape):
 await receipts.set(ctx, {
   key: doc._id,
   text: doc.note,
   sortKey: doc.createdAt,
-  shard: shardOf(doc.createdAt),
 });
 
-// Reads: pass the live shard list, newest first.
-const page = await receipts.search(ctx, {
+// Every shard that holds entries, newest first:
+const page = await receipts.search(ctx, { query: "停車" });
+
+// Only the last 90 days (pass `now` in; queries must not read the clock):
+const recent = await receipts.search(ctx, {
+  query: "停車",
+  shards: receipts.shardsBetween(args.now, args.now - 90 * 24 * 3600 * 1000),
+});
+```
+
+Without `shards`, the search finds the next shard with one index range, so empty
+periods cost nothing. `shardsBetween` works at shard grain: the oldest and
+newest shard can return hits a little outside the range.
+
+Sharding bounds the cost when a search is limited to recent shards. A search
+over every shard reads about what one large namespace would. A query whose every
+gram is in most entries (shared prefixes such as `TR-26`) still reads every
+shard to finish, so limit such searches by time.
+
+Without a `period`, name the shard yourself and pass the shard list, newest
+first:
+
+```ts
+await receipts.set(ctx, { ...entry, shard: "2026Q3" });
+await receipts.search(ctx, {
   shards: ["2026Q3", "2026Q2", "2026Q1"],
   query: "停車",
 });
 ```
 
 The contract: derive the shard from the `sortKey`, so shard ranges are disjoint
-and newest-first shard order makes concatenated results globally sorted.
-Recent-first UIs get their answers from the first shard at a fraction of the
-cost; paging naturally continues into older shards (same cursor contract as
-`SearchIndex.search`).
+and newest-first shard order makes concatenated results globally sorted. Paging
+continues into older shards with the same cursor contract as
+`SearchIndex.search`.
 
 ## How it works
 

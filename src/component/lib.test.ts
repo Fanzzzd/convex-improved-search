@@ -1001,3 +1001,48 @@ describe("clearNamespace", () => {
 		expect(other).not.toBeNull();
 	});
 });
+
+describe("namespaceBefore", () => {
+	test("steps down through the namespaces under a prefix that hold Entries", async () => {
+		const t = initConvexTest();
+		for (const namespace of [
+			"r/2026Q1",
+			"r/2026Q3",
+			"r/2025Q4",
+			"r",
+			"rx/2026Q4",
+			"s/2027Q1",
+		]) {
+			for (const key of ["a", "b", "c"]) {
+				await t.mutation(api.lib.set, {
+					namespace,
+					key,
+					fields: asFields("停車"),
+					sortKey: 1,
+				});
+			}
+		}
+		await t.mutation(api.lib.remove, { namespace: "r/2025Q4", key: "a" });
+		await t.mutation(api.lib.set, {
+			namespace: "r/2024Q1",
+			key: "gone",
+			fields: asFields("x"),
+			sortKey: 1,
+		});
+		await t.mutation(api.lib.remove, { namespace: "r/2024Q1", key: "gone" });
+
+		const seen: string[] = [];
+		let before: string | undefined;
+		for (;;) {
+			const namespace = await t.query(api.lib.namespaceBefore, {
+				prefix: "r/",
+				before,
+			});
+			if (namespace === null) break;
+			seen.push(namespace);
+			before = namespace;
+		}
+		// An emptied namespace drops out; "r", "rx/…" and "s/…" never match.
+		expect(seen).toEqual(["r/2026Q3", "r/2026Q1", "r/2025Q4"]);
+	});
+});

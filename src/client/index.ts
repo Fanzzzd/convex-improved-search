@@ -594,11 +594,60 @@ export function matchSegments(
 /** An IndexEntry that also names the time shard (or any partition) it lives in. */
 export type ShardedIndexEntry<Filter extends string = never> =
 	IndexEntry<Filter> & {
-		/** Shard name, e.g. "2026Q3". Must be derivable from the document alone. */
-		shard: string;
+		/**
+		 * Shard name, e.g. "2026Q3". Must be derivable from the document alone.
+		 * Optional under a `period`, which derives it from the sortKey.
+		 */
+		shard?: string;
 	};
 
+/** A calendar period in UTC. A dated shard holds the Entries whose sortKey (ms since epoch) falls in it. */
+export type ShardPeriod = "month" | "quarter" | "year";
+
 type ShardCursor = { shard: string; inner: string | null };
+
+const PERIODS: Record<
+	ShardPeriod,
+	{
+		perYear: number;
+		name: (year: number, i: number) => string;
+		pattern: RegExp;
+	}
+> = {
+	month: {
+		perYear: 12,
+		name: (year, i) => `${year}-${String(i + 1).padStart(2, "0")}`,
+		pattern: /^\d{4}-(0[1-9]|1[0-2])$/,
+	},
+	quarter: {
+		perYear: 4,
+		name: (year, i) => `${year}Q${i + 1}`,
+		pattern: /^\d{4}Q[1-4]$/,
+	},
+	year: { perYear: 1, name: (year) => `${year}`, pattern: /^\d{4}$/ },
+};
+
+/**
+ * The period's number counted from year 0. Four-digit years only, so that
+ * shard names sort as their periods do.
+ */
+function periodNumber(sortKey: number, period: ShardPeriod): number {
+	const date = new Date(sortKey);
+	const year = date.getUTCFullYear();
+	if (!(year >= 1000 && year <= 9999)) {
+		throw new Error(
+			`A dated shard needs a sortKey in ms since epoch between the years 1000 and 9999, got ${sortKey}`,
+		);
+	}
+	const { perYear } = PERIODS[period];
+	return year * perYear + Math.floor((date.getUTCMonth() * perYear) / 12);
+}
+
+function periodName(n: number, period: ShardPeriod): string {
+	const { perYear, name } = PERIODS[period];
+	const year = Math.floor(n / perYear);
+	return name(year, n - year * perYear);
+}
 
 /**
  * Time-sharded search: one SearchIndex per shard, all under one logical name.
@@ -632,6 +681,23 @@ type ShardCursor = { shard: string; inner: string | null };
  *   query: "停車",
  * });
  * ```
+ *
+ * With a `period`, the index derives each shard from the sortKey (UTC), and
+ * `search` without `shards` finds the shards that hold Entries, newest first,
+ * one index range per shard:
+ *
+ * ```ts
+ * export const receipts = new ShardedSearchIndex(components.improvedSearch, {
+ *   name: "receipts",
+ *   period: "quarter",
+ * });
+ * await receipts.set(ctx, { key: doc._id, text: doc.note, sortKey: doc.createdAt });
+ * await receipts.search(ctx, { query: "停車" }); // every shard
+ * await receipts.search(ctx, {
+ *   query: "停車",
+ *   shards: receipts.shardsBetween(args.now, args.now - 90 * DAY), // recent only
+ * });
+ * ```
  */
 export class ShardedSearchIndex<Filter extends string = never> {
 	private readonly shardIndexes = new Map<string, SearchIndex<Filter>>();
@@ -643,8 +709,67 @@ export class ShardedSearchIndex<Filter extends string = never> {
 			name: string;
 			/** Exact-match filter field names, for typing only. */
 			filterFields?: readonly Filter[];
+			/**
+			 * Shard by calendar period of the sortKey (ms since epoch, UTC):
+			 * "2026-07", "2026Q3" or "2026". Entries then need no `shard`, and
+			 * `search` needs no `shards`.
+			 */
+			period?: ShardPeriod;
 		},
 	) {}
+
+	/** The dated shard that holds this sortKey. Needs a `period`. */
+	shardOf(sortKey: number): string {
+		const period = this.requirePeriod("shardOf");
+		return periodName(periodNumber(sortKey, period), period);
+	}
+
+	/**
+	 * The dated shards from the one holding `newest` back to the one holding
+	 * `oldest`, newest first: a `shards` list for a time range. A shard is
+	 * the finest grain, so the end shards can hold hits outside the range.
+	 */
+	shardsBetween(newest: number, oldest: number): string[] {
+		const period = this.requirePeriod("shardsBetween");
+		const from = periodNumber(newest, period);
+		const to = periodNumber(oldest, period);
+		const shards: string[] = [];
+		for (let n = from; n >= to; n -= 1) shards.push(periodName(n, period));
+		return shards;
+	}
+
+	private requirePeriod(method: string): ShardPeriod {
+		if (this.options.period === undefined) {
+			throw new Error(`ShardedSearchIndex.${method} needs a \`period\``);
+		}
+		return this.options.period;
+	}
+
+	/** The entry's shard: given, or derived from its sortKey under a `period`. Both must agree. */
+	private shardFor(args: { shard?: string; sortKey?: number }): string {
+		const derived =
+			this.options.period === undefined || args.sortKey === undefined
+				? undefined
+				: this.shardOf(args.sortKey);
+		if (
+			args.shard !== undefined &&
+			derived !== undefined &&
+			args.shard !== derived
+		) {
+			throw new Error(
+				`sortKey ${args.sortKey} belongs in shard "${derived}", not "${args.shard}"`,
+			);
+		}
+		const shard = args.shard ?? derived;
+		if (shard === undefined) {
+			throw new Error(
+				this.options.period === undefined
+					? "ShardedSearchIndex needs the entry's `shard`"
+					: "ShardedSearchIndex needs the entry's `shard` or `sortKey`",
+			);
+		}
+		return shard;
+	}
 
 	/** The SearchIndex for one shard — full API (set/remove/get/clear/search). */
 	shard(shardName: string): SearchIndex<Filter> {
@@ -664,16 +789,16 @@ export class ShardedSearchIndex<Filter extends string = never> {
 		ctx: RunMutationCtx,
 		entry: ShardedIndexEntry<Filter>,
 	): Promise<void> {
-		const { shard, ...rest } = entry;
-		await this.shard(shard).set(ctx, rest);
+		const { shard: _shard, ...rest } = entry;
+		await this.shard(this.shardFor(entry)).set(ctx, rest);
 	}
 
-	/** Remove one document from the named shard. */
+	/** Remove one document from its shard: named, or derived from its sortKey under a `period`. */
 	async remove(
 		ctx: RunMutationCtx,
-		args: { shard: string; key: string },
+		args: { key: string; shard?: string; sortKey?: number },
 	): Promise<void> {
-		await this.shard(args.shard).remove(ctx, { key: args.key });
+		await this.shard(this.shardFor(args)).remove(ctx, { key: args.key });
 	}
 
 	/**
@@ -685,13 +810,42 @@ export class ShardedSearchIndex<Filter extends string = never> {
 	async search(
 		ctx: RunQueryCtx,
 		args: Omit<SearchArgs<Filter>, "fill"> & {
-			/** Live shard list, newest first. May grow between calls; a shard named by an in-flight cursor must still be present. */
-			shards: readonly string[];
+			/**
+			 * Live shard list, newest first. May grow between calls; a shard
+			 * named by an in-flight cursor must still be present. Optional under
+			 * a `period`: without it, the search visits every dated shard that
+			 * holds Entries.
+			 */
+			shards?: readonly string[];
 		},
 	): Promise<SearchResultPage> {
 		const limit = normalizeSearchLimit(args.limit);
 		const budget = normalizeSearchBudget(args.budget, limit);
-		let start = 0;
+		const list = args.shards;
+		const period =
+			list === undefined ? this.requirePeriod("search without `shards`") : null;
+		const prefix = `${this.options.name}/`;
+		/** The shard after `shard` (the first for null), or null past the last. */
+		const next = async (shard: string | null): Promise<string | null> => {
+			if (list !== undefined) {
+				const i = shard === null ? 0 : list.indexOf(shard) + 1;
+				return i < list.length ? list[i] : null;
+			}
+			let before = shard === null ? undefined : prefix + shard;
+			for (;;) {
+				const namespace = await ctx.runQuery(
+					this.component.lib.namespaceBefore,
+					{ prefix, before },
+				);
+				if (namespace === null) return null;
+				const name = namespace.slice(prefix.length);
+				// Another SearchIndex may be named under this prefix.
+				if (period !== null && PERIODS[period].pattern.test(name)) return name;
+				before = namespace;
+			}
+		};
+
+		let shard: string | null;
 		let inner: string | null = null;
 		if (args.cursor != null) {
 			let parsed: ShardCursor;
@@ -706,13 +860,15 @@ export class ShardedSearchIndex<Filter extends string = never> {
 			} catch {
 				throw new Error("Invalid sharded search cursor");
 			}
-			start = args.shards.indexOf(parsed.shard);
-			if (start === -1) {
+			if (list !== undefined && !list.includes(parsed.shard)) {
 				throw new Error(
 					`Sharded search cursor points at "${parsed.shard}", which is not in the shard list`,
 				);
 			}
+			shard = parsed.shard;
 			inner = parsed.inner;
+		} else {
+			shard = await next(null);
 		}
 
 		// Each shard call shares this transaction; the component plans for at
@@ -720,19 +876,19 @@ export class ShardedSearchIndex<Filter extends string = never> {
 		const maxShards = CALLS_PER_TRANSACTION;
 
 		const page: SearchResultPage["page"] = [];
-		for (let i = start; i < args.shards.length; i += 1) {
-			if (i - start >= maxShards) {
+		for (let visited = 0; shard !== null; visited += 1) {
+			if (visited >= maxShards) {
 				return {
 					page,
-					cursor: JSON.stringify({ shard: args.shards[i], inner: null }),
+					cursor: JSON.stringify({ shard, inner: null }),
 					isDone: false,
 				};
 			}
-			const result = await this.shard(args.shards[i]).search(ctx, {
+			const result = await this.shard(shard).search(ctx, {
 				query: args.query,
 				filters: args.filters,
 				fields: args.fields,
-				cursor: i === start ? inner : null,
+				cursor: visited === 0 ? inner : null,
 				limit: limit - page.length,
 				budget,
 			});
@@ -740,17 +896,15 @@ export class ShardedSearchIndex<Filter extends string = never> {
 			if (!result.isDone) {
 				return {
 					page,
-					cursor: JSON.stringify({
-						shard: args.shards[i],
-						inner: result.cursor,
-					}),
+					cursor: JSON.stringify({ shard, inner: result.cursor }),
 					isDone: false,
 				};
 			}
-			if (page.length >= limit && i + 1 < args.shards.length) {
+			shard = await next(shard);
+			if (page.length >= limit && shard !== null) {
 				return {
 					page,
-					cursor: JSON.stringify({ shard: args.shards[i + 1], inner: null }),
+					cursor: JSON.stringify({ shard, inner: null }),
 					isDone: false,
 				};
 			}
@@ -779,13 +933,15 @@ export class ShardedSearchIndex<Filter extends string = never> {
 				change.oldDoc === null ? null : await map(ctx, change.oldDoc);
 			const newEntry =
 				change.newDoc === null ? null : await map(ctx, change.newDoc);
+			const oldShard = oldEntry === null ? null : this.shardFor(oldEntry);
 			if (
 				oldEntry !== null &&
+				oldShard !== null &&
 				(newEntry === null ||
-					newEntry.shard !== oldEntry.shard ||
+					this.shardFor(newEntry) !== oldShard ||
 					newEntry.key !== oldEntry.key)
 			) {
-				await this.remove(ctx, { shard: oldEntry.shard, key: oldEntry.key });
+				await this.remove(ctx, { shard: oldShard, key: oldEntry.key });
 			}
 			if (newEntry !== null) {
 				await this.set(ctx, newEntry);

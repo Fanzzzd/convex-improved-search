@@ -8,7 +8,12 @@ import type { ComponentApi } from "./index.js";
  * for lib.search (substring filter, sortKey-desc order, offset cursor).
  */
 const component = {
-	lib: { search: "search", set: "set", remove: "remove" },
+	lib: {
+		search: "search",
+		set: "set",
+		remove: "remove",
+		namespaceBefore: "namespaceBefore",
+	},
 } as unknown as ComponentApi;
 
 type Row = { key: string; sortKey: number; text: string };
@@ -21,8 +26,25 @@ function makeCtx(corpus: Record<string, Row[]>) {
 		budget: number | undefined;
 		fields: string[] | undefined;
 	}[] = [];
+	// The `before` of every namespaceBefore lookup.
+	const lookups: (string | undefined)[] = [];
 	const ctx = {
-		runQuery: async (_ref: unknown, args: Record<string, unknown>) => {
+		runQuery: async (ref: unknown, args: Record<string, unknown>) => {
+			if (ref === "namespaceBefore") {
+				// The component's rule: greatest nonempty namespace with the prefix, below `before`.
+				const prefix = args.prefix as string;
+				const before = args.before as string | undefined;
+				const below = Object.keys(corpus)
+					.filter(
+						(ns) =>
+							ns.startsWith(prefix) &&
+							(before === undefined || ns < before) &&
+							corpus[ns].length > 0,
+					)
+					.sort();
+				lookups.push(before);
+				return below.at(-1) ?? null;
+			}
 			const namespace = args.namespace as string;
 			calls.push({
 				namespace,
@@ -44,7 +66,7 @@ function makeCtx(corpus: Record<string, Row[]>) {
 			return { page, cursor: isDone ? null : String(next), isDone };
 		},
 	};
-	return { ctx, calls };
+	return { ctx, calls, lookups };
 }
 
 function makeIndex() {
@@ -57,7 +79,7 @@ async function drain(
 		runQuery: (ref: unknown, args: Record<string, unknown>) => Promise<unknown>;
 	},
 	args: {
-		shards: readonly string[];
+		shards?: readonly string[];
 		query: string;
 		fields?: readonly string[];
 		limit?: number;
@@ -324,5 +346,165 @@ describe("sharded trigger", () => {
 			newDoc: { _id: "r2", note: "停車", createdAt: 150, archived: true },
 		});
 		expect(mutations).toHaveLength(0);
+	});
+});
+
+describe("dated shards", () => {
+	const at = (y: number, m: number, d = 1, ms = 0) =>
+		Date.UTC(y, m - 1, d) + ms;
+
+	function dated(period: "month" | "quarter" | "year") {
+		return new ShardedSearchIndex(component, { name: "receipts", period });
+	}
+
+	test("a shard is the UTC period of the sortKey", () => {
+		const lastMs = at(2026, 7, 1, -1); // 2026-06-30T23:59:59.999Z
+		expect(dated("month").shardOf(lastMs)).toBe("2026-06");
+		expect(dated("month").shardOf(lastMs + 1)).toBe("2026-07");
+		expect(dated("quarter").shardOf(lastMs)).toBe("2026Q2");
+		expect(dated("quarter").shardOf(lastMs + 1)).toBe("2026Q3");
+		expect(dated("quarter").shardOf(at(2026, 12, 31))).toBe("2026Q4");
+		expect(dated("year").shardOf(at(2026, 1, 1, -1))).toBe("2025");
+	});
+
+	test("shardsBetween lists periods newest first, across years", () => {
+		expect(
+			dated("month").shardsBetween(at(2026, 2, 3), at(2025, 11, 30)),
+		).toEqual(["2026-02", "2026-01", "2025-12", "2025-11"]);
+		expect(
+			dated("quarter").shardsBetween(at(2026, 4, 1), at(2025, 12, 31)),
+		).toEqual(["2026Q2", "2026Q1", "2025Q4"]);
+		expect(dated("year").shardsBetween(at(2026, 5, 1), at(2026, 1, 1))).toEqual(
+			["2026"],
+		);
+	});
+
+	test("sortKeys that are not four-digit-year timestamps throw", () => {
+		const index = dated("month");
+		for (const bad of [
+			Number.NaN,
+			Number.POSITIVE_INFINITY,
+			Date.UTC(999, 0),
+		]) {
+			expect(() => index.shardOf(bad)).toThrow(/ms since epoch/);
+		}
+		expect(() => makeIndex().shardOf(0)).toThrow(/needs a `period`/);
+	});
+
+	test("set derives the shard and rejects one that disagrees with the sortKey", async () => {
+		const index = dated("quarter");
+		const mutations: Record<string, unknown>[] = [];
+		const ctx = {
+			runMutation: async (_ref: unknown, args: Record<string, unknown>) => {
+				mutations.push(args);
+			},
+		};
+		await index.set(ctx as never, {
+			key: "r1",
+			text: "停車",
+			sortKey: at(2026, 8, 9),
+		});
+		expect(mutations[0]).toMatchObject({
+			namespace: "receipts/2026Q3",
+			key: "r1",
+		});
+		await expect(
+			index.set(ctx as never, {
+				key: "r2",
+				text: "停車",
+				sortKey: at(2026, 8, 9),
+				shard: "2026Q2",
+			}),
+		).rejects.toThrow(/belongs in shard "2026Q3"/);
+		await index.remove(ctx as never, { key: "r1", sortKey: at(2026, 8, 9) });
+		expect(mutations[1]).toMatchObject({
+			namespace: "receipts/2026Q3",
+			key: "r1",
+		});
+		await expect(
+			makeIndex().set(ctx as never, { key: "r3", text: "x", sortKey: 1 }),
+		).rejects.toThrow(/needs the entry's `shard`/);
+	});
+
+	test("the trigger moves an Entry whose sortKey crosses a period", async () => {
+		const index = dated("month");
+		const mutations: { ref: unknown; namespace: unknown }[] = [];
+		const ctx = {
+			runMutation: async (ref: unknown, args: Record<string, unknown>) => {
+				mutations.push({ ref, namespace: args.namespace });
+			},
+		};
+		const trigger = index.trigger<{
+			_id: string;
+			note: string;
+			createdAt: number;
+		}>((_ctx, doc) => ({
+			key: doc._id,
+			text: doc.note,
+			sortKey: doc.createdAt,
+		}));
+		await trigger(ctx as never, {
+			operation: "update",
+			id: "r1",
+			oldDoc: { _id: "r1", note: "停車", createdAt: at(2026, 7, 31) },
+			newDoc: { _id: "r1", note: "停車", createdAt: at(2026, 8, 1) },
+		});
+		expect(mutations).toEqual([
+			{ ref: component.lib.remove, namespace: "receipts/2026-07" },
+			{ ref: component.lib.set, namespace: "receipts/2026-08" },
+		]);
+	});
+
+	const corpus: Record<string, Row[]> = {
+		...quarters,
+		// Shards with no Entries are never visited.
+		"receipts/2025Q4": [],
+		// Another index under the same prefix is not a shard.
+		"receipts/archive": [{ key: "a-0", sortKey: 999, text: "停車" }],
+		// Nor is a sibling index whose name starts the same way.
+		receiptsX: [{ key: "x-0", sortKey: 998, text: "停車" }],
+		"receipts2/2026Q4": [{ key: "x-1", sortKey: 997, text: "停車" }],
+	};
+
+	test("without `shards`, search visits every shard that holds Entries, newest first", async () => {
+		const { ctx } = makeCtx(corpus);
+		const index = dated("quarter");
+		for (const limit of [1, 4, 50]) {
+			const found = await drain(index, ctx, { query: "停車", limit });
+			const listed = await drain(index, ctx, {
+				shards: ["2026Q3", "2026Q2", "2026Q1"],
+				query: "停車",
+				limit,
+			});
+			expect(found).toEqual(listed);
+			expect(found).toHaveLength(12);
+		}
+	});
+
+	test("each step to an older shard costs one lookup", async () => {
+		const { ctx, calls, lookups } = makeCtx(corpus);
+		const keys = await drain(dated("quarter"), ctx, { query: "過磅" });
+		expect(keys).toEqual(["q1-0"]);
+		expect(calls.map((call) => call.namespace)).toEqual([
+			"receipts/2026Q3",
+			"receipts/2026Q2",
+			"receipts/2026Q1",
+		]);
+		// First shard, then one after each shard; "archive" sorts above the
+		// shards and is skipped with one extra lookup.
+		expect(lookups).toEqual([
+			undefined,
+			"receipts/archive",
+			"receipts/2026Q3",
+			"receipts/2026Q2",
+			"receipts/2026Q1",
+		]);
+	});
+
+	test("search without `shards` or a `period` throws", async () => {
+		const { ctx } = makeCtx(corpus);
+		await expect(
+			makeIndex().search(ctx as never, { query: "x" }),
+		).rejects.toThrow(/needs a `period`/);
 	});
 });

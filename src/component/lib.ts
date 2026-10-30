@@ -1491,6 +1491,28 @@ export const get = query({
 });
 
 /**
+ * The greatest namespace below `before` (all of them when absent) that
+ * starts with `prefix` and holds an Entry, or null. One index range: how a
+ * dated ShardedSearchIndex lists its shards, newest first.
+ */
+export const namespaceBefore = query({
+	args: { prefix: v.string(), before: v.optional(v.string()) },
+	returns: v.union(v.string(), v.null()),
+	handler: async (ctx, args) => {
+		const doc = await ctx.db
+			.query("docs")
+			.withIndex("by_ns_sort", (q) =>
+				q
+					.gte("namespace", args.prefix)
+					.lt("namespace", args.before ?? `${args.prefix}\u{10ffff}`),
+			)
+			.order("desc")
+			.first();
+		return doc?.namespace ?? null;
+	},
+});
+
+/**
  * Delete one batch of a namespace. Docs die first (so nothing in the
  * namespace can match anymore after the first pass over docs), then
  * postings. The deletes themselves are the progress — each call restarts

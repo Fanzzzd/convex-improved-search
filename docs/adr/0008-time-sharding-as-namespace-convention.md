@@ -15,6 +15,14 @@ heterogeneous collections belong in one namespace with Filters instead. The
 shard list is passed per call (it grows over time); the cursor names its shard
 by string so list growth never invalidates it.
 
+A `period` (month, quarter, year in UTC) derives the shard from the sortKey, so
+a caller cannot put an Entry in the wrong shard, and the shard names sort as
+their periods do. Search then needs no shard list: the component's
+`namespaceBefore` returns the greatest namespace below a given one that starts
+with `${name}/` and holds a doc, in one range over `docs.by_ns_sort`. Empty
+periods are skipped at no cost, and the component still knows nothing about
+shards: it lists namespaces by prefix.
+
 Rejected: component-level shard management (a shards table, fan-out inside the
 component). It would recreate exactly the query fan-out the client can do with
 `runQuery` per namespace, while hard-coding one partitioning policy.
