@@ -143,8 +143,11 @@ function isPlan(value: unknown): value is string[] {
 	);
 }
 
+/** A Cursor before anything was scanned: the page that returns it read nothing. */
+const START_CURSOR = JSON.stringify({ t: 1 });
+
 function decodeCursor(raw: string | null | undefined): Cursor | null {
-	if (raw == null) return null;
+	if (raw == null || raw === START_CURSOR) return null;
 	try {
 		const parsed = JSON.parse(raw) as Cursor;
 		if (
@@ -675,6 +678,19 @@ export const search = query({
 		if (codepointCount === 0) return done;
 		const cursor = decodeCursor(args.cursor);
 		const wantedFilters = Object.entries(args.filters ?? {});
+		let headroom = await transactionHeadroom(ctx);
+		// A call always spends a probe and its first candidate, which the
+		// reserve covers. Once the caller has read into the reserve, that
+		// could overrun the transaction: hand the cursor back unspent.
+		if (headroom.ranges <= 0 || headroom.rows <= 0 || headroom.bytes <= 0) {
+			return {
+				page: [],
+				cursor: args.cursor ?? START_CURSOR,
+				isDone: false,
+				scanned: 0,
+				verified: 0,
+			};
+		}
 
 		// Pick the candidate stream. Single codepoint → the g1 index (every
 		// document character starts exactly one gram, so g1 coverage is
@@ -707,8 +723,8 @@ export const search = query({
 			if (probed[0].rows === 0) return done;
 			of = { gram: probed[0].gram };
 			checkGrams = probed.slice(1, 1 + CHECK_GRAMS).map((p) => p.gram);
+			headroom = await transactionHeadroom(ctx);
 		}
-		const headroom = await transactionHeadroom(ctx);
 		// Every stream of the call (candidates, checks, docs) spends from it.
 		const callBudget = new CallBudget(
 			Math.max(
@@ -1161,11 +1177,15 @@ export const set = mutation({
 		// Fold each field and spend one shared codepoint budget across them in
 		// the order given: the overflowing field is cut, later fields dropped.
 		const foldedFields: Record<string, string> = {};
+		// A Set, not `in foldedFields`: "constructor" is a valid Field name,
+		// and a Field dropped by the budget still counts as given.
+		const names = new Set<string>();
 		let budget = MAX_TEXT_LENGTH;
 		for (const field of args.fields) {
-			if (field.name in foldedFields) {
+			if (names.has(field.name)) {
 				throw new ConvexError(`Duplicate field name "${field.name}"`);
 			}
+			names.add(field.name);
 			const folded = fold(field.value);
 			const length = Array.from(folded).length;
 			if (length > budget) {

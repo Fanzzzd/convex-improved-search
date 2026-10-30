@@ -101,6 +101,7 @@ async function inOneTransaction(
 	args: SearchArgs,
 	calls: number,
 	before?: number,
+	start: string | null = null,
 ): Promise<{ calls: Call[]; totalRanges: number }> {
 	return await t.run(async (ctx) => {
 		// The caller's own reads before searching.
@@ -108,7 +109,7 @@ async function inOneTransaction(
 			await ctx.db.query("docs").first();
 		}
 		const out: Call[] = [];
-		let cursor: string | null = null;
+		let cursor = start;
 		for (let i = 0; i < calls; i++) {
 			const start = await ctx.meta.getTransactionMetrics();
 			const page: Page = await ctx.runQuery(api.lib.search, {
@@ -131,9 +132,13 @@ async function inOneTransaction(
 }
 
 /** Drain across transactions; returns every hit key. */
-async function drain(t: T, args: SearchArgs): Promise<string[]> {
+async function drain(
+	t: T,
+	args: SearchArgs,
+	start: string | null = null,
+): Promise<string[]> {
 	const keys: string[] = [];
-	let cursor: string | null = null;
+	let cursor = start;
 	for (let round = 0; round < 500; round++) {
 		const result: Page = await t.query(api.lib.search, {
 			namespace: NS,
@@ -215,5 +220,44 @@ describe("common prefix, rare suffix (payable-system TR-260720-006)", () => {
 		expect(totalRanges).toBeLessThanOrEqual(RANGE_LIMIT);
 		expect(calls[0].page.isDone).toBe(false);
 		expect(calls[0].page.cursor).not.toBeNull();
+	}, 120_000);
+
+	test("a call that starts inside the reserve reads nothing and hands its cursor back", async () => {
+		const t = initConvexTest();
+		const args = { query: "abcdefghijklmnopq", limit: 50 };
+		for (let i = 0; i < 3; i += 1) {
+			await t.mutation(api.lib.set, {
+				namespace: NS,
+				key: String(i),
+				fields: [{ name: "text", value: args.query }],
+				sortKey: i,
+			});
+		}
+		// 16 ranges left: the probe alone (up to 16 grams) would overrun.
+		const first: Page = await t.query(api.lib.search, {
+			namespace: NS,
+			...args,
+			limit: 1,
+		});
+		expect(first.cursor).not.toBeNull();
+		for (const cursor of [null, first.cursor]) {
+			const { calls, totalRanges } = await inOneTransaction(
+				t,
+				args,
+				1,
+				RANGE_LIMIT - 16,
+				cursor,
+			);
+			expect(totalRanges).toBe(RANGE_LIMIT - 16);
+			const page = calls[0].page;
+			expect(page.page).toEqual([]);
+			expect(page.isDone).toBe(false);
+			expect(page.cursor).not.toBeNull();
+			if (cursor !== null) expect(page.cursor).toBe(cursor);
+			// The next transaction resumes where the cursor points.
+			expect(await drain(t, args, page.cursor)).toEqual(
+				await drain(t, args, cursor),
+			);
+		}
 	}, 120_000);
 });

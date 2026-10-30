@@ -388,10 +388,11 @@ continues into older shards with the same cursor contract as
   rows, 16 MiB read, and 15 s of total database time) with your own reads and
   with every other `search` in it. Each call checks what the transaction has
   left, keeps 512 ranges, 4096 rows and 2 MiB for you, and otherwise returns a
-  short page with a cursor. The 15 s limit cannot be measured from inside the
-  query, so the reserve does not cover it. Calling `search` in a loop inside one
-  query therefore adds up; use `fill: true` and `fields` instead, and page
-  further from the client.
+  short page with a cursor. If your reads have already reached the reserve,
+  search reads nothing and returns a cursor to retry in a fresh transaction. The
+  15 s limit cannot be measured from inside the query, so the reserve does not
+  cover it. Calling `search` in a loop inside one query therefore adds up; use
+  `fill: true` and `fields` instead, and page further from the client.
 - **Exact identifiers**: to look up a whole document number, an equality index
   on your own table answers in one index range. Substring search is for partial
   numbers and free text.

@@ -296,6 +296,23 @@ describe("fields", () => {
 		).rejects.toThrow(/Duplicate field/);
 	});
 
+	test.each(["constructor", "toString", "hasOwnProperty"])(
+		"a Field may be named like an Object.prototype key (%s)",
+		async (name) => {
+			const t = initConvexTest();
+			await seed(t, [
+				{ key: "k", fields: [{ name, value: "停車" }], sortKey: 1 },
+			]);
+			const result = await t.query(api.lib.search, {
+				namespace: NS,
+				query: "停車",
+			});
+			expect(result.page).toEqual([
+				{ key: "k", sortKey: 1, matchedFields: [name] },
+			]);
+		},
+	);
+
 	test("the codepoint budget is shared across fields, spent in field order", async () => {
 		const t = initConvexTest();
 		await t.mutation(api.lib.set, {
