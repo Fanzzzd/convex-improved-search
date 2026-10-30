@@ -501,6 +501,56 @@ describe("dated shards", () => {
 		]);
 	});
 
+	test("unrelated namespaces spend the visit budget and resume without being searched", async () => {
+		const unrelated = Object.fromEntries(
+			Array.from({ length: 20 }, (_, i) => [
+				`receipts/z${String(i).padStart(3, "0")}`,
+				[{ key: `other-${i}`, sortKey: 999, text: "停車" }],
+			]),
+		);
+		const { ctx, calls, lookups } = makeCtx({ ...quarters, ...unrelated });
+		const index = dated("quarter");
+		const first = await index.search(ctx as never, { query: "停車" });
+		expect(first.page).toEqual([]);
+		expect(first.isDone).toBe(false);
+		expect(first.cursor).not.toBeNull();
+		expect(calls).toHaveLength(0);
+		expect(lookups.length).toBeLessThanOrEqual(5);
+		let cursor = first.cursor;
+		const keys: string[] = [];
+		for (let i = 0; i < 10; i += 1) {
+			const before = lookups.length;
+			const result = await index.search(ctx as never, {
+				query: "停車",
+				cursor,
+			});
+			expect(lookups.length - before).toBeLessThanOrEqual(4);
+			keys.push(...result.page.map((hit) => hit.key));
+			if (result.isDone) {
+				expect(result.cursor).toBeNull();
+				cursor = null;
+				break;
+			}
+			expect(result.cursor).not.toBe(cursor);
+			cursor = result.cursor;
+		}
+		expect(cursor).toBeNull();
+		expect(keys).toEqual([
+			...quarters["receipts/2026Q3"].map((row) => row.key),
+			...quarters["receipts/2026Q2"].map((row) => row.key),
+		]);
+		expect(calls.every((call) => !call.namespace.includes("/z"))).toBe(true);
+	});
+
+	test("duplicate explicit shard names are rejected before reading", async () => {
+		const { ctx, calls, lookups } = makeCtx({});
+		await expect(
+			makeIndex().search(ctx as never, { query: "x", shards: ["a", "a", "b"] }),
+		).rejects.toThrow(/unique shard names/);
+		expect(calls).toHaveLength(0);
+		expect(lookups).toHaveLength(0);
+	});
+
 	test("search without `shards` or a `period` throws", async () => {
 		const { ctx } = makeCtx(corpus);
 		await expect(

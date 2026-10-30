@@ -822,6 +822,9 @@ export class ShardedSearchIndex<Filter extends string = never> {
 		const limit = normalizeSearchLimit(args.limit);
 		const budget = normalizeSearchBudget(args.budget, limit);
 		const list = args.shards;
+		if (list !== undefined && new Set(list).size !== list.length) {
+			throw new Error("Sharded search needs unique shard names");
+		}
 		const period =
 			list === undefined ? this.requirePeriod("search without `shards`") : null;
 		const prefix = `${this.options.name}/`;
@@ -831,18 +834,11 @@ export class ShardedSearchIndex<Filter extends string = never> {
 				const i = shard === null ? 0 : list.indexOf(shard) + 1;
 				return i < list.length ? list[i] : null;
 			}
-			let before = shard === null ? undefined : prefix + shard;
-			for (;;) {
-				const namespace = await ctx.runQuery(
-					this.component.lib.namespaceBefore,
-					{ prefix, before },
-				);
-				if (namespace === null) return null;
-				const name = namespace.slice(prefix.length);
-				// Another SearchIndex may be named under this prefix.
-				if (period !== null && PERIODS[period].pattern.test(name)) return name;
-				before = namespace;
-			}
+			const namespace = await ctx.runQuery(this.component.lib.namespaceBefore, {
+				prefix,
+				before: shard === null ? undefined : prefix + shard,
+			});
+			return namespace === null ? null : namespace.slice(prefix.length);
 		};
 
 		let shard: string | null;
@@ -883,6 +879,13 @@ export class ShardedSearchIndex<Filter extends string = never> {
 					cursor: JSON.stringify({ shard, inner: null }),
 					isDone: false,
 				};
+			}
+			// A namespace under this prefix need not be a dated shard. Skipping
+			// it spends a visit too, and the cursor can resume before searching it.
+			if (period !== null && !PERIODS[period].pattern.test(shard)) {
+				shard = await next(shard);
+				inner = null;
+				continue;
 			}
 			const result = await this.shard(shard).search(ctx, {
 				query: args.query,
