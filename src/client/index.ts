@@ -1,64 +1,49 @@
 import type {
-  GenericDataModel,
-  GenericMutationCtx,
-  GenericQueryCtx,
+	GenericDataModel,
+	GenericMutationCtx,
+	GenericQueryCtx,
 } from "convex/server";
 import type { ComponentApi } from "../component/_generated/component.js";
 
 import { fold } from "../component/grams.js";
+import {
+	CALLS_PER_TRANSACTION,
+	MAX_SCAN_BUDGET,
+	normalizeBudget as normalizeSearchBudget,
+	normalizeLimit as normalizeSearchLimit,
+} from "../component/limits.js";
 
 export { MAX_TEXT_LENGTH, fold } from "../component/grams.js";
 
 /** Exact-match filter values. `null` is a real value; an absent field matches nothing. */
 export type FilterValue = string | number | boolean | null;
 
-/** Mirror the component's defaults (used for client-side bookkeeping only). */
-const DEFAULT_LIMIT = 50;
-const DEFAULT_SCAN_BUDGET = 256;
-const MAX_LIMIT = 200;
-const MAX_SCAN_BUDGET = 768;
 /**
- * `fill` bounds: total candidates scanned across all calls (each costs up to
- * 4 index ranges, so ~3072 of the 4096 per transaction) and calls per fill.
- * The call cap bounds rows streamed past duplicates, which `scanned` omits.
+ * `fill` bounds: total candidates verified across all calls (the
+ * component's `verified`) and calls per fill. The call cap bounds the rows
+ * streamed past rejected candidates, which `verified` omits. Each component
+ * call also caps itself at what the transaction has left.
  */
 const FILL_SCAN_BUDGET = MAX_SCAN_BUDGET;
-const MAX_FILL_CALLS = 4;
-
-function normalizeSearchLimit(raw: number | undefined): number {
-  if (raw !== undefined && !Number.isFinite(raw)) {
-    throw new Error("Search limit must be a finite number");
-  }
-  return Math.max(1, Math.min(Math.floor(raw ?? DEFAULT_LIMIT), MAX_LIMIT));
-}
-
-function normalizeSearchBudget(raw: number | undefined, limit: number): number {
-  if (raw !== undefined && !Number.isFinite(raw)) {
-    throw new Error("Search budget must be a finite number");
-  }
-  return Math.max(
-    limit,
-    Math.min(Math.floor(raw ?? DEFAULT_SCAN_BUDGET), MAX_SCAN_BUDGET),
-  );
-}
+const MAX_FILL_CALLS = CALLS_PER_TRANSACTION;
 
 export type SearchHit = {
-  key: string;
-  sortKey: number;
-  /** Names of the entry's fields whose text contains the query (single-text entries: ["text"]). */
-  matchedFields: string[];
+	key: string;
+	sortKey: number;
+	/** Names of the entry's fields whose text contains the query (single-text entries: ["text"]). */
+	matchedFields: string[];
 };
 
 export type SearchResultPage = {
-  page: SearchHit[];
-  /**
-   * Pass back to keep paging. IMPORTANT: a non-null cursor with a short (or
-   * even empty) page means the scan budget ran out before the page filled —
-   * keep paging and matches keep arriving. Only `isDone: true` means the
-   * search is exhausted.
-   */
-  cursor: string | null;
-  isDone: boolean;
+	page: SearchHit[];
+	/**
+	 * Pass back to keep paging. IMPORTANT: a non-null cursor with a short (or
+	 * even empty) page means the scan budget ran out before the page filled —
+	 * keep paging and matches keep arriving. Only `isDone: true` means the
+	 * search is exhausted.
+	 */
+	cursor: string | null;
+	isDone: boolean;
 };
 
 /**
@@ -70,34 +55,45 @@ export type SearchResultPage = {
 export type SearchText = string | Record<string, string>;
 
 export type IndexEntry<Filter extends string = never> = {
-  /** Identifier of the indexed document — typically your doc's `_id`. */
-  key: string;
-  /** The searchable text. Folded (NFKC + lowercase) and bigram-indexed per field. */
-  text: SearchText;
-  /** Results are ordered by sortKey descending — typically a creation timestamp. */
-  sortKey: number;
-  filters?: Partial<Record<Filter, FilterValue>>;
-  /** Behavior when the folded fields exceed MAX_TEXT_LENGTH codepoints in total. Default "truncate". */
-  onOverflow?: "truncate" | "error";
+	/** Identifier of the indexed document — typically your doc's `_id`. */
+	key: string;
+	/** The searchable text. Folded (NFKC + lowercase) and bigram-indexed per field. */
+	text: SearchText;
+	/** Results are ordered by sortKey descending — typically a creation timestamp. */
+	sortKey: number;
+	filters?: Partial<Record<Filter, FilterValue>>;
+	/** Behavior when the folded fields exceed MAX_TEXT_LENGTH codepoints in total. Default "truncate". */
+	onOverflow?: "truncate" | "error";
 };
 
 export type SearchArgs<Filter extends string = never> = {
-  query: string;
-  filters?: Partial<Record<Filter, FilterValue>>;
-  cursor?: string | null;
-  limit?: number;
-  /**
-   * Max candidate postings scanned this call. Raise for very selective
-   * filters. Under `fill`, the cap across all calls (default and maximum 768).
-   */
-  budget?: number;
-  /**
-   * Keep paging inside the call until the page holds `limit` hits, the
-   * search is done, or the scan cap is spent. The returned cursor resumes
-   * after the last scanned row, as without `fill`; `isDone` stays the only
-   * end-of-results signal.
-   */
-  fill?: boolean;
+	query: string;
+	filters?: Partial<Record<Filter, FilterValue>>;
+	/**
+	 * Match only these fields: hits whose query occurrence lies in other
+	 * fields are dropped inside the component, and `matchedFields` lists only
+	 * these. Use this instead of filtering `matchedFields` afterwards, so
+	 * `fill` and the scan budget count what you keep. `[]` matches nothing.
+	 */
+	fields?: readonly string[];
+	cursor?: string | null;
+	limit?: number;
+	/**
+	 * Max candidates verified against their documents this call. Raise for
+	 * very selective filters. Under `fill`, the cap across all calls (default
+	 * and maximum 768). Every call shares the transaction's read limits
+	 * with your own reads and with every other `search` in the same query, so
+	 * the component also stops early when the transaction runs low: the page
+	 * comes back short with a cursor, as when the budget runs out.
+	 */
+	budget?: number;
+	/**
+	 * Keep paging inside the call until the page holds `limit` hits, the
+	 * search is done, or the scan cap is spent. The returned cursor resumes
+	 * after the last scanned row, as without `fill`; `isDone` stays the only
+	 * end-of-results signal.
+	 */
+	fill?: boolean;
 };
 
 /** The `paginationOpts` shape Convex clients (e.g. usePaginatedQuery) send. */
@@ -118,36 +114,36 @@ export type DbMutationCtx = RunQueryCtx & RunMutationCtx & { db: MinimalDb };
 
 /** Wire shape: an ordered field list (Convex records do not preserve key order). */
 function wireFields(text: SearchText): { name: string; value: string }[] {
-  return typeof text === "string"
-    ? [{ name: "text", value: text }]
-    : Object.entries(text).map(([name, value]) => ({ name, value }));
+	return typeof text === "string"
+		? [{ name: "text", value: text }]
+		: Object.entries(text).map(([name, value]) => ({ name, value }));
 }
 
 /** Drop `undefined` entries (allowed by Partial<>) — the wire format has real values only. */
 function compactFilters(
-  filters: Partial<Record<string, FilterValue>> | undefined,
+	filters: Partial<Record<string, FilterValue>> | undefined,
 ): Record<string, FilterValue> | undefined {
-  if (filters === undefined) return undefined;
-  const entries = Object.entries(filters).filter(
-    (entry): entry is [string, FilterValue] => entry[1] !== undefined,
-  );
-  return Object.fromEntries(entries);
+	if (filters === undefined) return undefined;
+	const entries = Object.entries(filters).filter(
+		(entry): entry is [string, FilterValue] => entry[1] !== undefined,
+	);
+	return Object.fromEntries(entries);
 }
 
 async function getDoc<D>(
-  ctx: DbQueryCtx,
-  table: string,
-  key: string,
+	ctx: DbQueryCtx,
+	table: string,
+	key: string,
 ): Promise<D | null> {
-  return (await ctx.db.get(table, key)) as D | null;
+	return (await ctx.db.get(table, key)) as D | null;
 }
 
 /** The change shape produced by `convex-helpers/server/triggers` (structural — no hard dependency). */
 type TriggerChange<D> = {
-  operation: "insert" | "update" | "delete";
-  id: string;
-  oldDoc: D | null;
-  newDoc: D | null;
+	operation: "insert" | "update" | "delete";
+	id: string;
+	oldDoc: D | null;
+	newDoc: D | null;
 };
 
 /**
@@ -183,350 +179,351 @@ type TriggerChange<D> = {
  * ```
  */
 export class SearchIndex<Filter extends string = never> {
-  constructor(
-    private readonly component: ComponentApi,
-    private readonly options: {
-      /** Namespace inside the component. One name per logical collection. */
-      name: string;
-      /**
-       * Exact-match filter field names, for typing only — misspelled
-       * fields in `set`/`search` become compile errors.
-       */
-      filterFields?: readonly Filter[];
-    },
-  ) {}
+	constructor(
+		private readonly component: ComponentApi,
+		private readonly options: {
+			/** Namespace inside the component. One name per logical collection. */
+			name: string;
+			/**
+			 * Exact-match filter field names, for typing only — misspelled
+			 * fields in `set`/`search` become compile errors.
+			 */
+			filterFields?: readonly Filter[];
+		},
+	) {}
 
-  /** Insert or replace one document in the index. Idempotent; edits pay only the gram diff. */
-  async set(ctx: RunMutationCtx, entry: IndexEntry<Filter>): Promise<void> {
-    await ctx.runMutation(this.component.lib.set, {
-      namespace: this.options.name,
-      key: entry.key,
-      fields: wireFields(entry.text),
-      sortKey: entry.sortKey,
-      filters: compactFilters(entry.filters),
-      onOverflow: entry.onOverflow,
-    });
-  }
+	/** Insert or replace one document in the index. Idempotent; edits pay only the gram diff. */
+	async set(ctx: RunMutationCtx, entry: IndexEntry<Filter>): Promise<void> {
+		await ctx.runMutation(this.component.lib.set, {
+			namespace: this.options.name,
+			key: entry.key,
+			fields: wireFields(entry.text),
+			sortKey: entry.sortKey,
+			filters: compactFilters(entry.filters),
+			onOverflow: entry.onOverflow,
+		});
+	}
 
-  /** Remove one document from the index. No-op when absent. */
-  async remove(ctx: RunMutationCtx, args: { key: string }): Promise<void> {
-    await ctx.runMutation(this.component.lib.remove, {
-      namespace: this.options.name,
-      key: args.key,
-    });
-  }
+	/** Remove one document from the index. No-op when absent. */
+	async remove(ctx: RunMutationCtx, args: { key: string }): Promise<void> {
+		await ctx.runMutation(this.component.lib.remove, {
+			namespace: this.options.name,
+			key: args.key,
+		});
+	}
 
-  /**
-   * Exact substring search over the index, newest first.
-   * The result set is exactly `docs.filter((d) => someField(d, (f) => fold(f).includes(fold(query))))`
-   * — the inverted index only accelerates, never approximates.
-   */
-  async search(
-    ctx: RunQueryCtx,
-    args: SearchArgs<Filter>,
-  ): Promise<SearchResultPage> {
-    return await this.collect(ctx, args, async (hits) => hits);
-  }
+	/**
+	 * Exact substring search over the index, newest first.
+	 * The result set is exactly `docs.filter((d) => someField(d, (f) => fold(f).includes(fold(query))))`
+	 * — the inverted index only accelerates, never approximates.
+	 */
+	async search(
+		ctx: RunQueryCtx,
+		args: SearchArgs<Filter>,
+	): Promise<SearchResultPage> {
+		return await this.collect(ctx, args, async (hits) => hits);
+	}
 
-  private async searchOnce(
-    ctx: RunQueryCtx,
-    args: Omit<SearchArgs<Filter>, "fill">,
-  ): Promise<SearchResultPage & { scanned: number }> {
-    return await ctx.runQuery(this.component.lib.search, {
-      namespace: this.options.name,
-      query: args.query,
-      filters: compactFilters(args.filters),
-      cursor: args.cursor,
-      limit: args.limit,
-      budget: args.budget,
-    });
-  }
+	private async searchOnce(
+		ctx: RunQueryCtx,
+		args: Omit<SearchArgs<Filter>, "fill">,
+	): Promise<SearchResultPage & { verified: number }> {
+		return await ctx.runQuery(this.component.lib.search, {
+			namespace: this.options.name,
+			query: args.query,
+			filters: compactFilters(args.filters),
+			fields: args.fields === undefined ? undefined : [...args.fields],
+			cursor: args.cursor,
+			limit: args.limit,
+			budget: args.budget,
+		});
+	}
 
-  /**
-   * One component call, or under `fill` up to MAX_FILL_CALLS of them, each
-   * page passed through `hydrate` (which may drop hits) before counting.
-   */
-  private async collect<H>(
-    ctx: RunQueryCtx,
-    args: SearchArgs<Filter>,
-    hydrate: (hits: SearchHit[]) => Promise<H[]>,
-  ): Promise<{ page: H[]; cursor: string | null; isDone: boolean }> {
-    const { fill, ...once } = args;
-    if (!fill) {
-      const { page, cursor, isDone } = await this.searchOnce(ctx, once);
-      return { page: await hydrate(page), cursor, isDone };
-    }
-    const limit = normalizeSearchLimit(args.limit);
-    let remaining =
-      args.budget === undefined
-        ? FILL_SCAN_BUDGET
-        : normalizeSearchBudget(args.budget, limit);
-    const page: H[] = [];
-    let cursor = args.cursor ?? null;
-    let isDone = false;
-    for (let calls = 0; calls < MAX_FILL_CALLS; calls += 1) {
-      const wanted = limit - page.length;
-      const result = await this.searchOnce(ctx, {
-        ...once,
-        cursor,
-        // The component raises budget to at least limit; keep both under
-        // the remaining cap so the total never exceeds it.
-        limit: Math.min(wanted, remaining),
-        budget: remaining,
-      });
-      page.push(...(await hydrate(result.page)));
-      cursor = result.cursor;
-      isDone = result.isDone;
-      remaining -= result.scanned;
-      if (isDone || cursor === null || page.length >= limit || remaining <= 0) {
-        break;
-      }
-    }
-    return { page, cursor, isDone };
-  }
+	/**
+	 * One component call, or under `fill` up to MAX_FILL_CALLS of them, each
+	 * page passed through `hydrate` (which may drop hits) before counting.
+	 */
+	private async collect<H>(
+		ctx: RunQueryCtx,
+		args: SearchArgs<Filter>,
+		hydrate: (hits: SearchHit[]) => Promise<H[]>,
+	): Promise<{ page: H[]; cursor: string | null; isDone: boolean }> {
+		const { fill, ...once } = args;
+		if (!fill) {
+			const { page, cursor, isDone } = await this.searchOnce(ctx, once);
+			return { page: await hydrate(page), cursor, isDone };
+		}
+		const limit = normalizeSearchLimit(args.limit);
+		let remaining =
+			args.budget === undefined
+				? FILL_SCAN_BUDGET
+				: normalizeSearchBudget(args.budget, limit);
+		const page: H[] = [];
+		let cursor = args.cursor ?? null;
+		let isDone = false;
+		for (let calls = 0; calls < MAX_FILL_CALLS; calls += 1) {
+			const wanted = limit - page.length;
+			const result = await this.searchOnce(ctx, {
+				...once,
+				cursor,
+				// The component raises budget to at least limit; keep both under
+				// the remaining cap so the total never exceeds it.
+				limit: Math.min(wanted, remaining),
+				budget: remaining,
+			});
+			page.push(...(await hydrate(result.page)));
+			cursor = result.cursor;
+			isDone = result.isDone;
+			remaining -= result.verified;
+			if (isDone || cursor === null || page.length >= limit || remaining <= 0) {
+				break;
+			}
+		}
+		return { page, cursor, isDone };
+	}
 
-  /**
-   * Search + hydrate in one call, for the common case where `key` is a
-   * document `_id` of one table. Keys whose document is gone are dropped
-   * (the page may come up short; the cursor contract is unchanged). With
-   * `fill`, dropped keys count as misses and paging continues.
-   */
-  async searchDocs<D>(
-    ctx: DbQueryCtx,
-    args: SearchArgs<Filter> & { table: string },
-  ): Promise<{
-    page: { doc: D; sortKey: number; matchedFields: string[] }[];
-    cursor: string | null;
-    isDone: boolean;
-  }> {
-    const { table, ...searchArgs } = args;
-    return await this.collect(ctx, searchArgs, async (hits) => {
-      const docs = await Promise.all(
-        hits.map((hit) => getDoc<D>(ctx, table, hit.key)),
-      );
-      return hits.flatMap((hit, i) => {
-        const doc = docs[i];
-        return doc === null
-          ? []
-          : [{ doc, sortKey: hit.sortKey, matchedFields: hit.matchedFields }];
-      });
-    });
-  }
+	/**
+	 * Search + hydrate in one call, for the common case where `key` is a
+	 * document `_id` of one table. Keys whose document is gone are dropped
+	 * (the page may come up short; the cursor contract is unchanged). With
+	 * `fill`, dropped keys count as misses and paging continues.
+	 */
+	async searchDocs<D>(
+		ctx: DbQueryCtx,
+		args: SearchArgs<Filter> & { table: string },
+	): Promise<{
+		page: { doc: D; sortKey: number; matchedFields: string[] }[];
+		cursor: string | null;
+		isDone: boolean;
+	}> {
+		const { table, ...searchArgs } = args;
+		return await this.collect(ctx, searchArgs, async (hits) => {
+			const docs = await Promise.all(
+				hits.map((hit) => getDoc<D>(ctx, table, hit.key)),
+			);
+			return hits.flatMap((hit, i) => {
+				const doc = docs[i];
+				return doc === null
+					? []
+					: [{ doc, sortKey: hit.sortKey, matchedFields: hit.matchedFields }];
+			});
+		});
+	}
 
-  /**
-   * `search` in Convex's standard paginated shape, so an app query can take
-   * `paginationOpts: paginationOptsValidator` and plug into paginated-query
-   * clients. (Pages are cursor-stable but, unlike `.paginate()`, not
-   * gapless under live updates.)
-   */
-  async searchPaginated(
-    ctx: RunQueryCtx,
-    args: Omit<SearchArgs<Filter>, "cursor" | "limit"> & {
-      paginationOpts: PaginationOptsLike;
-    },
-  ): Promise<{ page: SearchHit[]; isDone: boolean; continueCursor: string }> {
-    const { paginationOpts, ...rest } = args;
-    const result = await this.search(ctx, {
-      ...rest,
-      cursor: paginationOpts.cursor,
-      limit: paginationOpts.numItems,
-    });
-    return {
-      page: result.page,
-      isDone: result.isDone,
-      continueCursor: result.cursor ?? "",
-    };
-  }
+	/**
+	 * `search` in Convex's standard paginated shape, so an app query can take
+	 * `paginationOpts: paginationOptsValidator` and plug into paginated-query
+	 * clients. (Pages are cursor-stable but, unlike `.paginate()`, not
+	 * gapless under live updates.)
+	 */
+	async searchPaginated(
+		ctx: RunQueryCtx,
+		args: Omit<SearchArgs<Filter>, "cursor" | "limit"> & {
+			paginationOpts: PaginationOptsLike;
+		},
+	): Promise<{ page: SearchHit[]; isDone: boolean; continueCursor: string }> {
+		const { paginationOpts, ...rest } = args;
+		const result = await this.search(ctx, {
+			...rest,
+			cursor: paginationOpts.cursor,
+			limit: paginationOpts.numItems,
+		});
+		return {
+			page: result.page,
+			isDone: result.isDone,
+			continueCursor: result.cursor ?? "",
+		};
+	}
 
-  /** `searchDocs` in Convex's standard paginated shape. */
-  async searchDocsPaginated<D>(
-    ctx: DbQueryCtx,
-    args: Omit<SearchArgs<Filter>, "cursor" | "limit"> & {
-      table: string;
-      paginationOpts: PaginationOptsLike;
-    },
-  ): Promise<{
-    page: { doc: D; sortKey: number; matchedFields: string[] }[];
-    isDone: boolean;
-    continueCursor: string;
-  }> {
-    const { paginationOpts, ...rest } = args;
-    const result = await this.searchDocs<D>(ctx, {
-      ...rest,
-      cursor: paginationOpts.cursor,
-      limit: paginationOpts.numItems,
-    });
-    return {
-      page: result.page,
-      isDone: result.isDone,
-      continueCursor: result.cursor ?? "",
-    };
-  }
+	/** `searchDocs` in Convex's standard paginated shape. */
+	async searchDocsPaginated<D>(
+		ctx: DbQueryCtx,
+		args: Omit<SearchArgs<Filter>, "cursor" | "limit"> & {
+			table: string;
+			paginationOpts: PaginationOptsLike;
+		},
+	): Promise<{
+		page: { doc: D; sortKey: number; matchedFields: string[] }[];
+		isDone: boolean;
+		continueCursor: string;
+	}> {
+		const { paginationOpts, ...rest } = args;
+		const result = await this.searchDocs<D>(ctx, {
+			...rest,
+			cursor: paginationOpts.cursor,
+			limit: paginationOpts.numItems,
+		});
+		return {
+			page: result.page,
+			isDone: result.isDone,
+			continueCursor: result.cursor ?? "",
+		};
+	}
 
-  /** What the index believes about one key (drift inspection for reconcile recipes). */
-  async get(
-    ctx: RunQueryCtx,
-    args: { key: string },
-  ): Promise<{
-    fields: Record<string, string>;
-    sortKey: number;
-    filters?: Record<string, FilterValue>;
-  } | null> {
-    return await ctx.runQuery(this.component.lib.get, {
-      namespace: this.options.name,
-      key: args.key,
-    });
-  }
+	/** What the index believes about one key (drift inspection for reconcile recipes). */
+	async get(
+		ctx: RunQueryCtx,
+		args: { key: string },
+	): Promise<{
+		fields: Record<string, string>;
+		sortKey: number;
+		filters?: Record<string, FilterValue>;
+	} | null> {
+		return await ctx.runQuery(this.component.lib.get, {
+			namespace: this.options.name,
+			key: args.key,
+		});
+	}
 
-  /**
-   * Delete one batch of the index. Loop until the returned cursor is null:
-   *
-   * ```ts
-   * let cursor: string | null = null;
-   * do { ({ cursor } = await notesSearch.clear(ctx, { cursor })); } while (cursor !== null);
-   * ```
-   * (Run the loop across scheduled mutations for large namespaces.)
-   */
-  async clear(
-    ctx: RunMutationCtx,
-    args?: { cursor?: string | null },
-  ): Promise<{ cursor: string | null }> {
-    return await ctx.runMutation(this.component.lib.clearNamespace, {
-      namespace: this.options.name,
-      cursor: args?.cursor,
-    });
-  }
+	/**
+	 * Delete one batch of the index. Loop until the returned cursor is null:
+	 *
+	 * ```ts
+	 * let cursor: string | null = null;
+	 * do { ({ cursor } = await notesSearch.clear(ctx, { cursor })); } while (cursor !== null);
+	 * ```
+	 * (Run the loop across scheduled mutations for large namespaces.)
+	 */
+	async clear(
+		ctx: RunMutationCtx,
+		args?: { cursor?: string | null },
+	): Promise<{ cursor: string | null }> {
+		return await ctx.runMutation(this.component.lib.clearNamespace, {
+			namespace: this.options.name,
+			cursor: args?.cursor,
+		});
+	}
 
-  /**
-   * Bind this index to one table with one mapper, and every sync path comes
-   * for free: `sync(ctx, id)` after any write (works for hard deletes too),
-   * `syncDoc(ctx, doc)` for backfill migrations, and `trigger()` for
-   * `convex-helpers/server/triggers`. Returning `null` keeps the document
-   * out of the index (archived rows, wrong status…).
-   *
-   * Pass your app's ctx type as `Ctx` when the mapper derives text through
-   * app reads (`tableIndexer<Doc<"notes">, MutationCtx>({ … })`) — sync
-   * paths then demand that ctx, and the mapper gets it fully typed.
-   */
-  tableIndexer<
-    D extends { _id: string },
-    Ctx extends DbMutationCtx = DbMutationCtx,
-  >(options: {
-    table: string;
-    /** Index key for a document id. Default: the id itself. */
-    key?: (id: string) => string;
-    map: (
-      ctx: Ctx,
-      doc: D,
-    ) =>
-      | Omit<IndexEntry<Filter>, "key">
-      | null
-      | Promise<Omit<IndexEntry<Filter>, "key"> | null>;
-  }): TableIndexer<D, Filter, Ctx> {
-    return new TableIndexer(this, options);
-  }
+	/**
+	 * Bind this index to one table with one mapper, and every sync path comes
+	 * for free: `sync(ctx, id)` after any write (works for hard deletes too),
+	 * `syncDoc(ctx, doc)` for backfill migrations, and `trigger()` for
+	 * `convex-helpers/server/triggers`. Returning `null` keeps the document
+	 * out of the index (archived rows, wrong status…).
+	 *
+	 * Pass your app's ctx type as `Ctx` when the mapper derives text through
+	 * app reads (`tableIndexer<Doc<"notes">, MutationCtx>({ … })`) — sync
+	 * paths then demand that ctx, and the mapper gets it fully typed.
+	 */
+	tableIndexer<
+		D extends { _id: string },
+		Ctx extends DbMutationCtx = DbMutationCtx,
+	>(options: {
+		table: string;
+		/** Index key for a document id. Default: the id itself. */
+		key?: (id: string) => string;
+		map: (
+			ctx: Ctx,
+			doc: D,
+		) =>
+			| Omit<IndexEntry<Filter>, "key">
+			| null
+			| Promise<Omit<IndexEntry<Filter>, "key"> | null>;
+	}): TableIndexer<D, Filter, Ctx> {
+		return new TableIndexer(this, options);
+	}
 }
 
 export class TableIndexer<
-  D extends { _id: string },
-  Filter extends string = never,
-  Ctx extends DbMutationCtx = DbMutationCtx,
+	D extends { _id: string },
+	Filter extends string = never,
+	Ctx extends DbMutationCtx = DbMutationCtx,
 > {
-  constructor(
-    private readonly index: SearchIndex<Filter>,
-    private readonly options: {
-      table: string;
-      key?: (id: string) => string;
-      map: (
-        ctx: Ctx,
-        doc: D,
-      ) =>
-        | Omit<IndexEntry<Filter>, "key">
-        | null
-        | Promise<Omit<IndexEntry<Filter>, "key"> | null>;
-    },
-  ) {}
+	constructor(
+		private readonly index: SearchIndex<Filter>,
+		private readonly options: {
+			table: string;
+			key?: (id: string) => string;
+			map: (
+				ctx: Ctx,
+				doc: D,
+			) =>
+				| Omit<IndexEntry<Filter>, "key">
+				| null
+				| Promise<Omit<IndexEntry<Filter>, "key"> | null>;
+		},
+	) {}
 
-  private keyOf(id: string): string {
-    return this.options.key === undefined ? id : this.options.key(id);
-  }
+	private keyOf(id: string): string {
+		return this.options.key === undefined ? id : this.options.key(id);
+	}
 
-  /**
-   * Bring one document's index entry in line with the table — call once
-   * after any write in the same mutation. A missing document (hard delete)
-   * or a `null` mapping removes the entry; anything else upserts it.
-   */
-  async sync(ctx: Ctx, id: string): Promise<void> {
-    const doc = await getDoc<D>(ctx, this.options.table, id);
-    await this.syncDoc(ctx, doc, id);
-  }
+	/**
+	 * Bring one document's index entry in line with the table — call once
+	 * after any write in the same mutation. A missing document (hard delete)
+	 * or a `null` mapping removes the entry; anything else upserts it.
+	 */
+	async sync(ctx: Ctx, id: string): Promise<void> {
+		const doc = await getDoc<D>(ctx, this.options.table, id);
+		await this.syncDoc(ctx, doc, id);
+	}
 
-  /** `sync` for callers already holding the document — e.g. a migration's `migrateOne`. */
-  async syncDoc(ctx: Ctx, doc: D | null, id?: string): Promise<void> {
-    const docId = doc?._id ?? id;
-    if (docId === undefined) {
-      throw new Error("syncDoc needs a document or an explicit id");
-    }
-    await this.applyEntry(
-      ctx,
-      docId,
-      doc === null ? null : await this.options.map(ctx, doc),
-    );
-  }
+	/** `sync` for callers already holding the document — e.g. a migration's `migrateOne`. */
+	async syncDoc(ctx: Ctx, doc: D | null, id?: string): Promise<void> {
+		const docId = doc?._id ?? id;
+		if (docId === undefined) {
+			throw new Error("syncDoc needs a document or an explicit id");
+		}
+		await this.applyEntry(
+			ctx,
+			docId,
+			doc === null ? null : await this.options.map(ctx, doc),
+		);
+	}
 
-  /** Re-sync a batch of documents (e.g. every receipt of one dispatch after replanning). */
-  async syncMany(ctx: Ctx, ids: Iterable<string>): Promise<void> {
-    for (const id of ids) await this.sync(ctx, id);
-  }
+	/** Re-sync a batch of documents (e.g. every receipt of one dispatch after replanning). */
+	async syncMany(ctx: Ctx, ids: Iterable<string>): Promise<void> {
+		for (const id of ids) await this.sync(ctx, id);
+	}
 
-  /**
-   * A trigger for `convex-helpers/server/triggers`, driven by the same
-   * mapper: `triggers.register("notes", notesIndexer.trigger())`.
-   *
-   * An update whose mapped entry is unchanged is skipped: `set` would
-   * find nothing to do, but it still costs a component call and a row
-   * read, and most writes to an indexed table (a status flip, a counter, a
-   * reorder) touch no indexed text. The mapper runs on the old document
-   * too, so a mapper that reads other tables pays that read twice on an
-   * update. Pass `{ skipUnchanged: false }` to sync on every write, for
-   * example to repair an index after out-of-band edits.
-   */
-  trigger(
-    options: { skipUnchanged?: boolean } = {},
-  ): (ctx: Ctx, change: TriggerChange<D>) => Promise<void> {
-    const skipUnchanged = options.skipUnchanged ?? true;
-    return async (ctx, change) => {
-      if (change.operation === "delete") {
-        await this.index.remove(ctx, { key: this.keyOf(change.id) });
-        return;
-      }
-      if (change.newDoc === null) return;
-      if (
-        skipUnchanged &&
-        change.operation === "update" &&
-        change.oldDoc !== null
-      ) {
-        const before = await this.options.map(ctx, change.oldDoc);
-        const after = await this.options.map(ctx, change.newDoc);
-        if (sameEntry(before, after)) return;
-        await this.applyEntry(ctx, change.newDoc._id, after);
-        return;
-      }
-      await this.syncDoc(ctx, change.newDoc);
-    };
-  }
+	/**
+	 * A trigger for `convex-helpers/server/triggers`, driven by the same
+	 * mapper: `triggers.register("notes", notesIndexer.trigger())`.
+	 *
+	 * An update whose mapped entry is unchanged is skipped: `set` would
+	 * find nothing to do, but it still costs a component call and a row
+	 * read, and most writes to an indexed table (a status flip, a counter, a
+	 * reorder) touch no indexed text. The mapper runs on the old document
+	 * too, so a mapper that reads other tables pays that read twice on an
+	 * update. Pass `{ skipUnchanged: false }` to sync on every write, for
+	 * example to repair an index after out-of-band edits.
+	 */
+	trigger(
+		options: { skipUnchanged?: boolean } = {},
+	): (ctx: Ctx, change: TriggerChange<D>) => Promise<void> {
+		const skipUnchanged = options.skipUnchanged ?? true;
+		return async (ctx, change) => {
+			if (change.operation === "delete") {
+				await this.index.remove(ctx, { key: this.keyOf(change.id) });
+				return;
+			}
+			if (change.newDoc === null) return;
+			if (
+				skipUnchanged &&
+				change.operation === "update" &&
+				change.oldDoc !== null
+			) {
+				const before = await this.options.map(ctx, change.oldDoc);
+				const after = await this.options.map(ctx, change.newDoc);
+				if (sameEntry(before, after)) return;
+				await this.applyEntry(ctx, change.newDoc._id, after);
+				return;
+			}
+			await this.syncDoc(ctx, change.newDoc);
+		};
+	}
 
-  private async applyEntry(
-    ctx: Ctx,
-    id: string,
-    entry: Omit<IndexEntry<Filter>, "key"> | null,
-  ): Promise<void> {
-    if (entry === null) {
-      await this.index.remove(ctx, { key: this.keyOf(id) });
-      return;
-    }
-    await this.index.set(ctx, { ...entry, key: this.keyOf(id) });
-  }
+	private async applyEntry(
+		ctx: Ctx,
+		id: string,
+		entry: Omit<IndexEntry<Filter>, "key"> | null,
+	): Promise<void> {
+		if (entry === null) {
+			await this.index.remove(ctx, { key: this.keyOf(id) });
+			return;
+		}
+		await this.index.set(ctx, { ...entry, key: this.keyOf(id) });
+	}
 }
 
 /**
@@ -534,10 +531,10 @@ export class TableIndexer<
  * JSON means the index already holds exactly this entry.
  */
 function sameEntry<Filter extends string>(
-  before: Omit<IndexEntry<Filter>, "key"> | null,
-  after: Omit<IndexEntry<Filter>, "key"> | null,
+	before: Omit<IndexEntry<Filter>, "key"> | null,
+	after: Omit<IndexEntry<Filter>, "key"> | null,
 ): boolean {
-  return JSON.stringify(before) === JSON.stringify(after);
+	return JSON.stringify(before) === JSON.stringify(after);
 }
 
 /**
@@ -550,29 +547,29 @@ function sameEntry<Filter extends string>(
  * itself is still the index's call, not this function's).
  */
 export function findFoldedRange(
-  text: string,
-  query: string,
+	text: string,
+	query: string,
 ): [number, number] | null {
-  const foldedQuery = fold(query);
-  if (!foldedQuery) return null;
-  let folded = "";
-  const originOf: number[] = [];
-  let origin = 0;
-  for (const ch of text) {
-    const foldedChar = fold(ch);
-    for (let i = 0; i < foldedChar.length; i += 1) originOf.push(origin);
-    folded += foldedChar;
-    origin += ch.length;
-  }
-  const at = folded.indexOf(foldedQuery);
-  if (at === -1) return null;
-  const start = originOf[at];
-  const lastOrigin = originOf[at + foldedQuery.length - 1];
-  const lastCp = text.codePointAt(lastOrigin);
-  return [
-    start,
-    lastOrigin + (lastCp !== undefined && lastCp > 0xffff ? 2 : 1),
-  ];
+	const foldedQuery = fold(query);
+	if (!foldedQuery) return null;
+	let folded = "";
+	const originOf: number[] = [];
+	let origin = 0;
+	for (const ch of text) {
+		const foldedChar = fold(ch);
+		for (let i = 0; i < foldedChar.length; i += 1) originOf.push(origin);
+		folded += foldedChar;
+		origin += ch.length;
+	}
+	const at = folded.indexOf(foldedQuery);
+	if (at === -1) return null;
+	const start = originOf[at];
+	const lastOrigin = originOf[at + foldedQuery.length - 1];
+	const lastCp = text.codePointAt(lastOrigin);
+	return [
+		start,
+		lastOrigin + (lastCp !== undefined && lastCp > 0xffff ? 2 : 1),
+	];
 }
 
 /**
@@ -580,28 +577,77 @@ export function findFoldedRange(
  * `matchSegments("ＡＢＣ大樓", "abc")` → `[{text: "ＡＢＣ", match: true}, {text: "大樓", match: false}]`.
  */
 export function matchSegments(
-  text: string,
-  query: string,
+	text: string,
+	query: string,
 ): { text: string; match: boolean }[] {
-  const range = findFoldedRange(text, query);
-  if (range === null) return [{ text, match: false }];
-  const segments: { text: string; match: boolean }[] = [];
-  if (range[0] > 0)
-    segments.push({ text: text.slice(0, range[0]), match: false });
-  segments.push({ text: text.slice(range[0], range[1]), match: true });
-  if (range[1] < text.length)
-    segments.push({ text: text.slice(range[1]), match: false });
-  return segments;
+	const range = findFoldedRange(text, query);
+	if (range === null) return [{ text, match: false }];
+	const segments: { text: string; match: boolean }[] = [];
+	if (range[0] > 0)
+		segments.push({ text: text.slice(0, range[0]), match: false });
+	segments.push({ text: text.slice(range[0], range[1]), match: true });
+	if (range[1] < text.length)
+		segments.push({ text: text.slice(range[1]), match: false });
+	return segments;
 }
 
 /** An IndexEntry that also names the time shard (or any partition) it lives in. */
 export type ShardedIndexEntry<Filter extends string = never> =
-  IndexEntry<Filter> & {
-    /** Shard name, e.g. "2026Q3". Must be derivable from the document alone. */
-    shard: string;
-  };
+	IndexEntry<Filter> & {
+		/**
+		 * Shard name, e.g. "2026Q3". Must be derivable from the document alone.
+		 * Optional under a `period`, which derives it from the sortKey.
+		 */
+		shard?: string;
+	};
+
+/** A calendar period in UTC. A dated shard holds the Entries whose sortKey (ms since epoch) falls in it. */
+export type ShardPeriod = "month" | "quarter" | "year";
 
 type ShardCursor = { shard: string; inner: string | null };
+
+const PERIODS: Record<
+	ShardPeriod,
+	{
+		perYear: number;
+		name: (year: number, i: number) => string;
+		pattern: RegExp;
+	}
+> = {
+	month: {
+		perYear: 12,
+		name: (year, i) => `${year}-${String(i + 1).padStart(2, "0")}`,
+		pattern: /^\d{4}-(0[1-9]|1[0-2])$/,
+	},
+	quarter: {
+		perYear: 4,
+		name: (year, i) => `${year}Q${i + 1}`,
+		pattern: /^\d{4}Q[1-4]$/,
+	},
+	year: { perYear: 1, name: (year) => `${year}`, pattern: /^\d{4}$/ },
+};
+
+/**
+ * The period's number counted from year 0. Four-digit years only, so that
+ * shard names sort as their periods do.
+ */
+function periodNumber(sortKey: number, period: ShardPeriod): number {
+	const date = new Date(sortKey);
+	const year = date.getUTCFullYear();
+	if (!(year >= 1000 && year <= 9999)) {
+		throw new Error(
+			`A dated shard needs a sortKey in ms since epoch between the years 1000 and 9999, got ${sortKey}`,
+		);
+	}
+	const { perYear } = PERIODS[period];
+	return year * perYear + Math.floor((date.getUTCMonth() * perYear) / 12);
+}
+
+function periodName(n: number, period: ShardPeriod): string {
+	const { perYear, name } = PERIODS[period];
+	const year = Math.floor(n / perYear);
+	return name(year, n - year * perYear);
+}
 
 /**
  * Time-sharded search: one SearchIndex per shard, all under one logical name.
@@ -635,165 +681,276 @@ type ShardCursor = { shard: string; inner: string | null };
  *   query: "停車",
  * });
  * ```
+ *
+ * With a `period`, the index derives each shard from the sortKey (UTC), and
+ * `search` without `shards` finds the shards that hold Entries, newest first,
+ * one index range per shard:
+ *
+ * ```ts
+ * export const receipts = new ShardedSearchIndex(components.improvedSearch, {
+ *   name: "receipts",
+ *   period: "quarter",
+ * });
+ * await receipts.set(ctx, { key: doc._id, text: doc.note, sortKey: doc.createdAt });
+ * await receipts.search(ctx, { query: "停車" }); // every shard
+ * await receipts.search(ctx, {
+ *   query: "停車",
+ *   shards: receipts.shardsBetween(args.now, args.now - 90 * DAY), // recent only
+ * });
+ * ```
  */
 export class ShardedSearchIndex<Filter extends string = never> {
-  private readonly shardIndexes = new Map<string, SearchIndex<Filter>>();
+	private readonly shardIndexes = new Map<string, SearchIndex<Filter>>();
 
-  constructor(
-    private readonly component: ComponentApi,
-    private readonly options: {
-      /** Logical collection name; shard s lives in namespace `${name}/${s}`. */
-      name: string;
-      /** Exact-match filter field names, for typing only. */
-      filterFields?: readonly Filter[];
-    },
-  ) {}
+	constructor(
+		private readonly component: ComponentApi,
+		private readonly options: {
+			/** Logical collection name; shard s lives in namespace `${name}/${s}`. */
+			name: string;
+			/** Exact-match filter field names, for typing only. */
+			filterFields?: readonly Filter[];
+			/**
+			 * Shard by calendar period of the sortKey (ms since epoch, UTC):
+			 * "2026-07", "2026Q3" or "2026". Entries then need no `shard`, and
+			 * `search` needs no `shards`.
+			 */
+			period?: ShardPeriod;
+		},
+	) {}
 
-  /** The SearchIndex for one shard — full API (set/remove/get/clear/search). */
-  shard(shardName: string): SearchIndex<Filter> {
-    let index = this.shardIndexes.get(shardName);
-    if (index === undefined) {
-      index = new SearchIndex(this.component, {
-        name: `${this.options.name}/${shardName}`,
-        filterFields: this.options.filterFields,
-      });
-      this.shardIndexes.set(shardName, index);
-    }
-    return index;
-  }
+	/** The dated shard that holds this sortKey. Needs a `period`. */
+	shardOf(sortKey: number): string {
+		const period = this.requirePeriod("shardOf");
+		return periodName(periodNumber(sortKey, period), period);
+	}
 
-  /** Insert or replace one document in its shard. */
-  async set(
-    ctx: RunMutationCtx,
-    entry: ShardedIndexEntry<Filter>,
-  ): Promise<void> {
-    const { shard, ...rest } = entry;
-    await this.shard(shard).set(ctx, rest);
-  }
+	/**
+	 * The dated shards from the one holding `newest` back to the one holding
+	 * `oldest`, newest first: a `shards` list for a time range. A shard is
+	 * the finest grain, so the end shards can hold hits outside the range.
+	 */
+	shardsBetween(newest: number, oldest: number): string[] {
+		const period = this.requirePeriod("shardsBetween");
+		const from = periodNumber(newest, period);
+		const to = periodNumber(oldest, period);
+		const shards: string[] = [];
+		for (let n = from; n >= to; n -= 1) shards.push(periodName(n, period));
+		return shards;
+	}
 
-  /** Remove one document from the named shard. */
-  async remove(
-    ctx: RunMutationCtx,
-    args: { shard: string; key: string },
-  ): Promise<void> {
-    await this.shard(args.shard).remove(ctx, { key: args.key });
-  }
+	private requirePeriod(method: string): ShardPeriod {
+		if (this.options.period === undefined) {
+			throw new Error(`ShardedSearchIndex.${method} needs a \`period\``);
+		}
+		return this.options.period;
+	}
 
-  /**
-   * Search across shards, in the given order. Same paging contract as
-   * SearchIndex.search: a short or empty page with a non-null cursor means
-   * "keep paging". The per-call `budget` applies to each shard visited, so
-   * one call visits at most a few shards; the cursor carries progress.
-   */
-  async search(
-    ctx: RunQueryCtx,
-    args: Omit<SearchArgs<Filter>, "fill"> & {
-      /** Live shard list, newest first. May grow between calls; a shard named by an in-flight cursor must still be present. */
-      shards: readonly string[];
-    },
-  ): Promise<SearchResultPage> {
-    const limit = normalizeSearchLimit(args.limit);
-    const budget = normalizeSearchBudget(args.budget, limit);
-    let start = 0;
-    let inner: string | null = null;
-    if (args.cursor != null) {
-      let parsed: ShardCursor;
-      try {
-        parsed = JSON.parse(args.cursor) as ShardCursor;
-        if (
-          typeof parsed.shard !== "string" ||
-          (parsed.inner !== null && typeof parsed.inner !== "string")
-        ) {
-          throw new Error("bad shape");
-        }
-      } catch {
-        throw new Error("Invalid sharded search cursor");
-      }
-      start = args.shards.indexOf(parsed.shard);
-      if (start === -1) {
-        throw new Error(
-          `Sharded search cursor points at "${parsed.shard}", which is not in the shard list`,
-        );
-      }
-      inner = parsed.inner;
-    }
+	/** The entry's shard: given, or derived from its sortKey under a `period`. Both must agree. */
+	private shardFor(args: { shard?: string; sortKey?: number }): string {
+		const derived =
+			this.options.period === undefined || args.sortKey === undefined
+				? undefined
+				: this.shardOf(args.sortKey);
+		if (
+			args.shard !== undefined &&
+			derived !== undefined &&
+			args.shard !== derived
+		) {
+			throw new Error(
+				`sortKey ${args.sortKey} belongs in shard "${derived}", not "${args.shard}"`,
+			);
+		}
+		const shard = args.shard ?? derived;
+		if (shard === undefined) {
+			throw new Error(
+				this.options.period === undefined
+					? "ShardedSearchIndex needs the entry's `shard`"
+					: "ShardedSearchIndex needs the entry's `shard` or `sortKey`",
+			);
+		}
+		return shard;
+	}
 
-    // Each drained shard can cost up to ~budget*4 reads inside the shared
-    // transaction, so bound the shards visited per call accordingly.
-    const maxShards = Math.max(1, Math.min(8, Math.floor(3072 / (budget * 4))));
+	/** The SearchIndex for one shard — full API (set/remove/get/clear/search). */
+	shard(shardName: string): SearchIndex<Filter> {
+		let index = this.shardIndexes.get(shardName);
+		if (index === undefined) {
+			index = new SearchIndex(this.component, {
+				name: `${this.options.name}/${shardName}`,
+				filterFields: this.options.filterFields,
+			});
+			this.shardIndexes.set(shardName, index);
+		}
+		return index;
+	}
 
-    const page: SearchResultPage["page"] = [];
-    for (let i = start; i < args.shards.length; i += 1) {
-      if (i - start >= maxShards) {
-        return {
-          page,
-          cursor: JSON.stringify({ shard: args.shards[i], inner: null }),
-          isDone: false,
-        };
-      }
-      const result = await this.shard(args.shards[i]).search(ctx, {
-        query: args.query,
-        filters: args.filters,
-        cursor: i === start ? inner : null,
-        limit: limit - page.length,
-        budget,
-      });
-      page.push(...result.page);
-      if (!result.isDone) {
-        return {
-          page,
-          cursor: JSON.stringify({
-            shard: args.shards[i],
-            inner: result.cursor,
-          }),
-          isDone: false,
-        };
-      }
-      if (page.length >= limit && i + 1 < args.shards.length) {
-        return {
-          page,
-          cursor: JSON.stringify({ shard: args.shards[i + 1], inner: null }),
-          isDone: false,
-        };
-      }
-    }
-    return { page, cursor: null, isDone: true };
-  }
+	/** Insert or replace one document in its shard. */
+	async set(
+		ctx: RunMutationCtx,
+		entry: ShardedIndexEntry<Filter>,
+	): Promise<void> {
+		const { shard: _shard, ...rest } = entry;
+		await this.shard(this.shardFor(entry)).set(ctx, rest);
+	}
 
-  /**
-   * A trigger for `convex-helpers/server/triggers`. The mapper names the
-   * shard, so the trigger can move a document between shards when the
-   * mapped shard changes, and knows which shard to delete from. A `null`
-   * mapping means "not indexed" — with a deterministic mapper there is
-   * nothing to remove either.
-   */
-  trigger<D extends { _id: string }>(
-    map: (
-      ctx: DbQueryCtx,
-      doc: D,
-    ) =>
-      | ShardedIndexEntry<Filter>
-      | null
-      | Promise<ShardedIndexEntry<Filter> | null>,
-  ): (ctx: DbMutationCtx, change: TriggerChange<D>) => Promise<void> {
-    return async (ctx, change) => {
-      const oldEntry =
-        change.oldDoc === null ? null : await map(ctx, change.oldDoc);
-      const newEntry =
-        change.newDoc === null ? null : await map(ctx, change.newDoc);
-      if (
-        oldEntry !== null &&
-        (newEntry === null ||
-          newEntry.shard !== oldEntry.shard ||
-          newEntry.key !== oldEntry.key)
-      ) {
-        await this.remove(ctx, { shard: oldEntry.shard, key: oldEntry.key });
-      }
-      if (newEntry !== null) {
-        await this.set(ctx, newEntry);
-      }
-    };
-  }
+	/** Remove one document from its shard: named, or derived from its sortKey under a `period`. */
+	async remove(
+		ctx: RunMutationCtx,
+		args: { key: string; shard?: string; sortKey?: number },
+	): Promise<void> {
+		await this.shard(this.shardFor(args)).remove(ctx, { key: args.key });
+	}
+
+	/**
+	 * Search across shards, in the given order. Same paging contract as
+	 * SearchIndex.search: a short or empty page with a non-null cursor means
+	 * "keep paging". The per-call `budget` applies to each shard visited, so
+	 * one call visits at most a few shards; the cursor carries progress.
+	 */
+	async search(
+		ctx: RunQueryCtx,
+		args: Omit<SearchArgs<Filter>, "fill"> & {
+			/**
+			 * Live shard list, newest first. May grow between calls; a shard
+			 * named by an in-flight cursor must still be present. Optional under
+			 * a `period`: without it, the search visits every dated shard that
+			 * holds Entries.
+			 */
+			shards?: readonly string[];
+		},
+	): Promise<SearchResultPage> {
+		const limit = normalizeSearchLimit(args.limit);
+		const budget = normalizeSearchBudget(args.budget, limit);
+		const list = args.shards;
+		if (list !== undefined && new Set(list).size !== list.length) {
+			throw new Error("Sharded search needs unique shard names");
+		}
+		const period =
+			list === undefined ? this.requirePeriod("search without `shards`") : null;
+		const prefix = `${this.options.name}/`;
+		/** The shard after `shard` (the first for null), or null past the last. */
+		const next = async (shard: string | null): Promise<string | null> => {
+			if (list !== undefined) {
+				const i = shard === null ? 0 : list.indexOf(shard) + 1;
+				return i < list.length ? list[i] : null;
+			}
+			const namespace = await ctx.runQuery(this.component.lib.namespaceBefore, {
+				prefix,
+				before: shard === null ? undefined : prefix + shard,
+			});
+			return namespace === null ? null : namespace.slice(prefix.length);
+		};
+
+		let shard: string | null;
+		let inner: string | null = null;
+		if (args.cursor != null) {
+			let parsed: ShardCursor;
+			try {
+				parsed = JSON.parse(args.cursor) as ShardCursor;
+				if (
+					typeof parsed.shard !== "string" ||
+					(parsed.inner !== null && typeof parsed.inner !== "string")
+				) {
+					throw new Error("bad shape");
+				}
+			} catch {
+				throw new Error("Invalid sharded search cursor");
+			}
+			if (list !== undefined && !list.includes(parsed.shard)) {
+				throw new Error(
+					`Sharded search cursor points at "${parsed.shard}", which is not in the shard list`,
+				);
+			}
+			shard = parsed.shard;
+			inner = parsed.inner;
+		} else {
+			shard = await next(null);
+		}
+
+		// Each shard call shares this transaction; the component plans for at
+		// most CALLS_PER_TRANSACTION of them (and caps each at what is left).
+		const maxShards = CALLS_PER_TRANSACTION;
+
+		const page: SearchResultPage["page"] = [];
+		for (let visited = 0; shard !== null; visited += 1) {
+			if (visited >= maxShards) {
+				return {
+					page,
+					cursor: JSON.stringify({ shard, inner: null }),
+					isDone: false,
+				};
+			}
+			// A namespace under this prefix need not be a dated shard. Skipping
+			// it spends a visit too, and the cursor can resume before searching it.
+			if (period !== null && !PERIODS[period].pattern.test(shard)) {
+				shard = await next(shard);
+				inner = null;
+				continue;
+			}
+			const result = await this.shard(shard).search(ctx, {
+				query: args.query,
+				filters: args.filters,
+				fields: args.fields,
+				cursor: visited === 0 ? inner : null,
+				limit: limit - page.length,
+				budget,
+			});
+			page.push(...result.page);
+			if (!result.isDone) {
+				return {
+					page,
+					cursor: JSON.stringify({ shard, inner: result.cursor }),
+					isDone: false,
+				};
+			}
+			shard = await next(shard);
+			if (page.length >= limit && shard !== null) {
+				return {
+					page,
+					cursor: JSON.stringify({ shard, inner: null }),
+					isDone: false,
+				};
+			}
+		}
+		return { page, cursor: null, isDone: true };
+	}
+
+	/**
+	 * A trigger for `convex-helpers/server/triggers`. The mapper names the
+	 * shard, so the trigger can move a document between shards when the
+	 * mapped shard changes, and knows which shard to delete from. A `null`
+	 * mapping means "not indexed" — with a deterministic mapper there is
+	 * nothing to remove either.
+	 */
+	trigger<D extends { _id: string }>(
+		map: (
+			ctx: DbQueryCtx,
+			doc: D,
+		) =>
+			| ShardedIndexEntry<Filter>
+			| null
+			| Promise<ShardedIndexEntry<Filter> | null>,
+	): (ctx: DbMutationCtx, change: TriggerChange<D>) => Promise<void> {
+		return async (ctx, change) => {
+			const oldEntry =
+				change.oldDoc === null ? null : await map(ctx, change.oldDoc);
+			const newEntry =
+				change.newDoc === null ? null : await map(ctx, change.newDoc);
+			const oldShard = oldEntry === null ? null : this.shardFor(oldEntry);
+			if (
+				oldEntry !== null &&
+				oldShard !== null &&
+				(newEntry === null ||
+					this.shardFor(newEntry) !== oldShard ||
+					newEntry.key !== oldEntry.key)
+			) {
+				await this.remove(ctx, { shard: oldShard, key: oldEntry.key });
+			}
+			if (newEntry !== null) {
+				await this.set(ctx, newEntry);
+			}
+		};
+	}
 }
 
 export type { ComponentApi };

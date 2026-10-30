@@ -14,5 +14,6 @@ npm ci
 npm run clean
 npm run typecheck
 npm run lint
+npm run format:check
 npm run test
 ```

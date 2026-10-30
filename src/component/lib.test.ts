@@ -73,7 +73,11 @@ describe("substring semantics", () => {
 	const corpus = [
 		{ key: "latin", fields: asFields("abcdefghijklm"), sortKey: 1 },
 		{ key: "thai", fields: asFields("กรุงเทพมหานคร"), sortKey: 2 },
-		{ key: "cjk", fields: asFields("回程過磅費，司機墊付停車場費用"), sortKey: 3 },
+		{
+			key: "cjk",
+			fields: asFields("回程過磅費，司機墊付停車場費用"),
+			sortKey: 3,
+		},
 		{ key: "mixed", fields: asFields("TR-260814-002 三菱倉→深圳"), sortKey: 4 },
 	];
 
@@ -166,9 +170,17 @@ describe("fields", () => {
 			sortKey: 1,
 		});
 		// Contiguous inside one field: matches, and names that field.
-		const noteHit = await t.query(api.lib.search, { namespace: NS, query: "停車場" });
-		expect(noteHit.page).toEqual([{ key: "r", sortKey: 1, matchedFields: ["note"] }]);
-		const cargoHit = await t.query(api.lib.search, { namespace: NS, query: "tr-999" });
+		const noteHit = await t.query(api.lib.search, {
+			namespace: NS,
+			query: "停車場",
+		});
+		expect(noteHit.page).toEqual([
+			{ key: "r", sortKey: 1, matchedFields: ["note"] },
+		]);
+		const cargoHit = await t.query(api.lib.search, {
+			namespace: NS,
+			query: "tr-999",
+		});
 		expect(cargoHit.page.map((row) => row.matchedFields)).toEqual([["cargo"]]);
 		// "費" ends note, "玻" starts cargo — adjacent across the boundary must not match.
 		expect(await searchAll(t, "費玻")).toEqual([]);
@@ -182,8 +194,13 @@ describe("fields", () => {
 			],
 			sortKey: 1,
 		});
-		const dual = await t.query(api.lib.search, { namespace: NS, query: "同一" });
-		expect(dual.page.map((row) => [...row.matchedFields].sort())).toEqual([["cargo", "note"]]);
+		const dual = await t.query(api.lib.search, {
+			namespace: NS,
+			query: "同一",
+		});
+		expect(dual.page.map((row) => [...row.matchedFields].sort())).toEqual([
+			["cargo", "note"],
+		]);
 	});
 
 	test("re-set can change the field layout; stale-field text is unfindable at once", async () => {
@@ -205,6 +222,65 @@ describe("fields", () => {
 		expect(hit.page.map((row) => row.matchedFields)).toEqual([["cargo"]]);
 	});
 
+	test("fields restricts which Fields can match and which are reported", async () => {
+		const t = initConvexTest();
+		await seed(t, [
+			{
+				key: "own",
+				fields: [
+					{ name: "no", value: "TR-1" },
+					{ name: "memo", value: "停車" },
+				],
+				sortKey: 3,
+			},
+			{
+				key: "cites",
+				fields: [
+					{ name: "no", value: "TR-2" },
+					{ name: "memo", value: "原單 TR-1" },
+				],
+				sortKey: 2,
+			},
+			{
+				key: "both",
+				fields: [
+					{ name: "no", value: "TR-1" },
+					{ name: "memo", value: "TR-1 補" },
+				],
+				sortKey: 1,
+			},
+		]);
+		const only = async (fields: string[]) =>
+			(
+				await t.query(api.lib.search, { namespace: NS, query: "tr-1", fields })
+			).page.map((row) => [row.key, [...row.matchedFields].sort()]);
+		expect(await only(["no"])).toEqual([
+			["own", ["no"]],
+			["both", ["no"]],
+		]);
+		expect(await only(["memo"])).toEqual([
+			["cites", ["memo"]],
+			["both", ["memo"]],
+		]);
+		expect(await only(["no", "memo", "absent"])).toEqual([
+			["own", ["no"]],
+			["cites", ["memo"]],
+			["both", ["memo", "no"]],
+		]);
+		const none = await t.query(api.lib.search, {
+			namespace: NS,
+			query: "tr-1",
+			fields: [],
+		});
+		expect(none).toEqual({
+			page: [],
+			cursor: null,
+			isDone: true,
+			scanned: 0,
+			verified: 0,
+		});
+	});
+
 	test("duplicate field names are refused", async () => {
 		const t = initConvexTest();
 		await expect(
@@ -219,6 +295,23 @@ describe("fields", () => {
 			}),
 		).rejects.toThrow(/Duplicate field/);
 	});
+
+	test.each(["constructor", "toString", "hasOwnProperty"])(
+		"a Field may be named like an Object.prototype key (%s)",
+		async (name) => {
+			const t = initConvexTest();
+			await seed(t, [
+				{ key: "k", fields: [{ name, value: "停車" }], sortKey: 1 },
+			]);
+			const result = await t.query(api.lib.search, {
+				namespace: NS,
+				query: "停車",
+			});
+			expect(result.page).toEqual([
+				{ key: "k", sortKey: 1, matchedFields: [name] },
+			]);
+		},
+	);
 
 	test("the codepoint budget is shared across fields, spent in field order", async () => {
 		const t = initConvexTest();
@@ -254,24 +347,58 @@ describe("filters", () => {
 	test("exact-match filters combine with search across the whole index", async () => {
 		const t = initConvexTest();
 		await seed(t, [
-			{ key: "a", fields: asFields("停車費用一"), sortKey: 1, filters: { source: "driver", flagged: true } },
-			{ key: "b", fields: asFields("停車費用二"), sortKey: 2, filters: { source: "staff" } },
-			{ key: "c", fields: asFields("過路費"), sortKey: 3, filters: { source: "driver" } },
+			{
+				key: "a",
+				fields: asFields("停車費用一"),
+				sortKey: 1,
+				filters: { source: "driver", flagged: true },
+			},
+			{
+				key: "b",
+				fields: asFields("停車費用二"),
+				sortKey: 2,
+				filters: { source: "staff" },
+			},
+			{
+				key: "c",
+				fields: asFields("過路費"),
+				sortKey: 3,
+				filters: { source: "driver" },
+			},
 		]);
-		expect(await searchAll(t, "停車", { filters: { source: "driver" } })).toEqual(["a"]);
-		expect(await searchAll(t, "停車", { filters: { source: "staff" } })).toEqual(["b"]);
+		expect(
+			await searchAll(t, "停車", { filters: { source: "driver" } }),
+		).toEqual(["a"]);
+		expect(
+			await searchAll(t, "停車", { filters: { source: "staff" } }),
+		).toEqual(["b"]);
 		expect(await searchAll(t, "停車", {})).toEqual(["b", "a"]);
-		expect(await searchAll(t, "停車", { filters: { source: "driver", flagged: true } })).toEqual(["a"]);
-		expect(await searchAll(t, "停車", { filters: { source: "driver", flagged: false } })).toEqual([]);
+		expect(
+			await searchAll(t, "停車", {
+				filters: { source: "driver", flagged: true },
+			}),
+		).toEqual(["a"]);
+		expect(
+			await searchAll(t, "停車", {
+				filters: { source: "driver", flagged: false },
+			}),
+		).toEqual([]);
 	});
 
 	test("absent field matches nothing, not even null", async () => {
 		const t = initConvexTest();
 		await seed(t, [
-			{ key: "a", fields: asFields("xyz"), sortKey: 1, filters: { category: null } },
+			{
+				key: "a",
+				fields: asFields("xyz"),
+				sortKey: 1,
+				filters: { category: null },
+			},
 			{ key: "b", fields: asFields("xyz"), sortKey: 2 },
 		]);
-		expect(await searchAll(t, "xyz", { filters: { category: null } })).toEqual(["a"]);
+		expect(await searchAll(t, "xyz", { filters: { category: null } })).toEqual([
+			"a",
+		]);
 	});
 
 	test("rejects non-finite numeric filters on writes and reads", async () => {
@@ -327,7 +454,12 @@ describe("updates and removal", () => {
 		const t = initConvexTest();
 		await seed(t, [{ key: "a", fields: asFields("舊備註內容"), sortKey: 1 }]);
 		expect(await searchAll(t, "舊備")).toEqual(["a"]);
-		await t.mutation(api.lib.set, { namespace: NS, key: "a", fields: asFields("新備註內容"), sortKey: 1 });
+		await t.mutation(api.lib.set, {
+			namespace: NS,
+			key: "a",
+			fields: asFields("新備註內容"),
+			sortKey: 1,
+		});
 		expect(await searchAll(t, "舊備")).toEqual([]);
 		expect(await searchAll(t, "新備")).toEqual(["a"]);
 		expect(await searchAll(t, "備註")).toEqual(["a"]);
@@ -340,56 +472,177 @@ describe("updates and removal", () => {
 			{ key: "b", fields: asFields("同文"), sortKey: 2 },
 		]);
 		expect(await searchAll(t, "同文")).toEqual(["b", "a"]);
-		await t.mutation(api.lib.set, { namespace: NS, key: "a", fields: asFields("同文"), sortKey: 3 });
+		await t.mutation(api.lib.set, {
+			namespace: NS,
+			key: "a",
+			fields: asFields("同文"),
+			sortKey: 3,
+		});
 		expect(await searchAll(t, "同文")).toEqual(["a", "b"]);
 	});
 
 	test("a filter-only or no-op re-set leaves the postings alone", async () => {
 		const t = initConvexTest();
-		await seed(t, [{ key: "a", fields: asFields("過磅單"), sortKey: 1, filters: { site: "x" } }]);
+		await seed(t, [
+			{
+				key: "a",
+				fields: asFields("過磅單"),
+				sortKey: 1,
+				filters: { site: "x" },
+			},
+		]);
 		const postingRows = () =>
 			t.run(async (ctx) =>
-				(await ctx.db.query("postings").collect()).map((p) => `${p._id}:${p.sortKey}`).sort(),
+				(await ctx.db.query("postings").collect())
+					.map((p) => `${p._id}:${p.sortKey}`)
+					.sort(),
 			);
 		const before = await postingRows();
 		await t.mutation(api.lib.set, {
-			namespace: NS, key: "a", fields: asFields("過磅單"), sortKey: 1, filters: { site: "y" },
+			namespace: NS,
+			key: "a",
+			fields: asFields("過磅單"),
+			sortKey: 1,
+			filters: { site: "y" },
 		});
 		expect(await searchAll(t, "過磅", { filters: { site: "x" } })).toEqual([]);
-		expect(await searchAll(t, "過磅", { filters: { site: "y" } })).toEqual(["a"]);
+		expect(await searchAll(t, "過磅", { filters: { site: "y" } })).toEqual([
+			"a",
+		]);
 		await t.mutation(api.lib.set, {
-			namespace: NS, key: "a", fields: asFields("過磅單"), sortKey: 1, filters: { site: "y" },
+			namespace: NS,
+			key: "a",
+			fields: asFields("過磅單"),
+			sortKey: 1,
+			filters: { site: "y" },
 		});
-		await t.mutation(api.lib.set, { namespace: NS, key: "a", fields: asFields("過磅單"), sortKey: 1 });
+		await t.mutation(api.lib.set, {
+			namespace: NS,
+			key: "a",
+			fields: asFields("過磅單"),
+			sortKey: 1,
+		});
 		expect(await searchAll(t, "過磅", { filters: { site: "y" } })).toEqual([]);
 		expect(await searchAll(t, "過磅")).toEqual(["a"]);
 		expect(await postingRows()).toEqual(before);
 	});
 
-	test("an unchanged re-set does not read the postings (a missing row stays missing)", async () => {
+	test("an unchanged re-set reads one posting, not all (a missing row stays missing)", async () => {
 		const t = initConvexTest();
 		await seed(t, [{ key: "a", fields: asFields("過磅單"), sortKey: 1 }]);
-		const countPostings = () => t.run(async (ctx) => (await ctx.db.query("postings").collect()).length);
+		const countPostings = () =>
+			t.run(async (ctx) => (await ctx.db.query("postings").collect()).length);
 		const full = await countPostings();
 		await t.run(async (ctx) => {
 			const row = await ctx.db.query("postings").first();
 			if (row !== null) await ctx.db.delete("postings", row._id);
 		});
-		await t.mutation(api.lib.set, { namespace: NS, key: "a", fields: asFields("過磅單"), sortKey: 1, filters: { site: "x" } });
+		await t.mutation(api.lib.set, {
+			namespace: NS,
+			key: "a",
+			fields: asFields("過磅單"),
+			sortKey: 1,
+			filters: { site: "x" },
+		});
 		expect(await countPostings()).toBe(full - 1);
 		// A text change runs the full diff again and repairs the gap.
-		await t.mutation(api.lib.set, { namespace: NS, key: "a", fields: asFields("過磅單!"), sortKey: 1 });
+		await t.mutation(api.lib.set, {
+			namespace: NS,
+			key: "a",
+			fields: asFields("過磅單!"),
+			sortKey: 1,
+		});
 		expect(await countPostings()).toBe(full + 1);
+	});
+
+	test("postings carry the Fields that hold their gram; set retags them, and re-setting a pre-0.5.0 entry tags it", async () => {
+		const t = initConvexTest();
+		// Grams end in the U+0001 sentinel, which Convex refuses as an object key.
+		const tags = async () =>
+			Object.fromEntries(
+				await t.run(async (ctx) =>
+					(await ctx.db.query("postings").collect()).map((p) => [
+						p.gram.replace("\u0001", "$"),
+						p.fields?.join(",") ?? "-",
+					]),
+				),
+			);
+		const fields = (no: string, memo: string) => [
+			{ name: "no", value: no },
+			{ name: "memo", value: memo },
+		];
+		await seed(t, [{ key: "a", fields: fields("ab", "bc"), sortKey: 1 }]);
+		expect(await tags()).toEqual({
+			ab: "no",
+			b$: "no",
+			bc: "memo",
+			c$: "memo",
+		});
+		// "ab" now also lies in memo: its row is patched, not rewritten.
+		await t.mutation(api.lib.set, {
+			namespace: NS,
+			key: "a",
+			fields: fields("ab", "abc"),
+			sortKey: 1,
+		});
+		expect((await tags()).ab).toBe("memo,no");
+		expect(
+			(
+				await t.query(api.lib.search, {
+					namespace: NS,
+					query: "ab",
+					fields: ["memo"],
+				})
+			).page,
+		).toEqual([{ key: "a", sortKey: 1, matchedFields: ["memo"] }]);
+		// Rows written before 0.5.0 have no tag; an unchanged re-set (the backfill) adds it.
+		await t.run(async (ctx) => {
+			for (const p of await ctx.db.query("postings").collect()) {
+				await ctx.db.replace("postings", p._id, {
+					namespace: p.namespace,
+					gram: p.gram,
+					g1: p.g1,
+					key: p.key,
+					sortKey: p.sortKey,
+				});
+			}
+		});
+		expect(
+			(
+				await t.query(api.lib.search, {
+					namespace: NS,
+					query: "bc",
+					fields: ["memo"],
+				})
+			).page,
+		).toEqual([{ key: "a", sortKey: 1, matchedFields: ["memo"] }]);
+		await t.mutation(api.lib.set, {
+			namespace: NS,
+			key: "a",
+			fields: fields("ab", "abc"),
+			sortKey: 1,
+		});
+		expect((await tags()).ab).toBe("memo,no");
 	});
 
 	test("renaming a field with the same text is not a no-op", async () => {
 		const t = initConvexTest();
-		await seed(t, [{ key: "a", fields: [{ name: "title", value: "停車" }], sortKey: 1 }]);
+		await seed(t, [
+			{ key: "a", fields: [{ name: "title", value: "停車" }], sortKey: 1 },
+		]);
 		await t.mutation(api.lib.set, {
-			namespace: NS, key: "a", fields: [{ name: "body", value: "停車" }], sortKey: 1,
+			namespace: NS,
+			key: "a",
+			fields: [{ name: "body", value: "停車" }],
+			sortKey: 1,
 		});
-		const result = await t.query(api.lib.search, { namespace: NS, query: "停車" });
-		expect(result.page).toEqual([{ key: "a", sortKey: 1, matchedFields: ["body"] }]);
+		const result = await t.query(api.lib.search, {
+			namespace: NS,
+			query: "停車",
+		});
+		expect(result.page).toEqual([
+			{ key: "a", sortKey: 1, matchedFields: ["body"] },
+		]);
 	});
 
 	test("remove drops the document", async () => {
@@ -406,7 +659,12 @@ describe("updates and removal", () => {
 
 	test("namespaces are isolated", async () => {
 		const t = initConvexTest();
-		await t.mutation(api.lib.set, { namespace: "other", key: "x", fields: asFields("香港"), sortKey: 1 });
+		await t.mutation(api.lib.set, {
+			namespace: "other",
+			key: "x",
+			fields: asFields("香港"),
+			sortKey: 1,
+		});
 		expect(await searchAll(t, "香港")).toEqual([]);
 	});
 });
@@ -437,21 +695,32 @@ describe("pagination", () => {
 			filters: { rare: i % 13 === 0 },
 		}));
 		await seed(t, docs);
-		const keys = await searchAll(t, "停車", { filters: { rare: true }, budget: 5, limit: 50 });
+		const keys = await searchAll(t, "停車", {
+			filters: { rare: true },
+			budget: 5,
+			limit: 50,
+		});
 		expect(keys).toEqual(["k39", "k26", "k13", "k00"]);
 	});
 });
 
 // Distinct CJK codepoints so a 4096-codepoint text produces ~4096 distinct grams.
 function bigText(length: number): string {
-	return Array.from({ length }, (_, i) => String.fromCodePoint(0x4e00 + (i % 20000))).join("");
+	return Array.from({ length }, (_, i) =>
+		String.fromCodePoint(0x4e00 + (i % 20000)),
+	).join("");
 }
 
 describe("limits", () => {
 	test("a 4096-codepoint document indexes, searches, edits, and deletes", async () => {
 		const t = initConvexTest();
 		const text = bigText(4096);
-		await t.mutation(api.lib.set, { namespace: NS, key: "big", fields: asFields(text), sortKey: 1 });
+		await t.mutation(api.lib.set, {
+			namespace: NS,
+			key: "big",
+			fields: asFields(text),
+			sortKey: 1,
+		});
 		// deep interior substring
 		const middle = Array.from(text).slice(2000, 2005).join("");
 		expect(await searchAll(t, middle)).toEqual(["big"]);
@@ -460,7 +729,12 @@ describe("limits", () => {
 		expect((await searchAll(t, lastChar)).includes("big")).toBe(true);
 		// a small edit is a gram diff, not a rebuild — and remains correct
 		const edited = `${Array.from(text).slice(0, 4090).join("")}停車場費用又`;
-		await t.mutation(api.lib.set, { namespace: NS, key: "big", fields: asFields(edited), sortKey: 1 });
+		await t.mutation(api.lib.set, {
+			namespace: NS,
+			key: "big",
+			fields: asFields(edited),
+			sortKey: 1,
+		});
 		expect(await searchAll(t, "停車場費用")).toEqual(["big"]);
 		await t.mutation(api.lib.remove, { namespace: NS, key: "big" });
 		expect(await searchAll(t, "停車場費用")).toEqual([]);
@@ -469,7 +743,12 @@ describe("limits", () => {
 	test("overflow truncates by default: beyond-limit text is unfindable but the doc still works", async () => {
 		const t = initConvexTest();
 		const text = bigText(4096) + "超出上限的尾巴";
-		await t.mutation(api.lib.set, { namespace: NS, key: "big", fields: asFields(text), sortKey: 1 });
+		await t.mutation(api.lib.set, {
+			namespace: NS,
+			key: "big",
+			fields: asFields(text),
+			sortKey: 1,
+		});
 		expect(await searchAll(t, "超出上限")).toEqual([]);
 		const kept = Array.from(text).slice(4090, 4096).join("");
 		expect(await searchAll(t, kept)).toEqual(["big"]);
@@ -490,7 +769,12 @@ describe("limits", () => {
 
 	test("empty text indexes as unfindable but get() still sees it", async () => {
 		const t = initConvexTest();
-		await t.mutation(api.lib.set, { namespace: NS, key: "e", fields: asFields(""), sortKey: 1 });
+		await t.mutation(api.lib.set, {
+			namespace: NS,
+			key: "e",
+			fields: asFields(""),
+			sortKey: 1,
+		});
 		expect(await searchAll(t, "a")).toEqual([]);
 		const doc = await t.query(api.lib.get, { namespace: NS, key: "e" });
 		expect(doc).toEqual({ fields: { text: "" }, sortKey: 1 });
@@ -505,8 +789,18 @@ describe("deferred reaping", () => {
 		try {
 			const t = initConvexTest();
 			const text = bigText(4096);
-			await t.mutation(api.lib.set, { namespace: NS, key: "big", fields: asFields(text), sortKey: 1 });
-			await t.mutation(api.lib.set, { namespace: NS, key: "small", fields: asFields("停車場"), sortKey: 2 });
+			await t.mutation(api.lib.set, {
+				namespace: NS,
+				key: "big",
+				fields: asFields(text),
+				sortKey: 1,
+			});
+			await t.mutation(api.lib.set, {
+				namespace: NS,
+				key: "small",
+				fields: asFields("停車場"),
+				sortKey: 2,
+			});
 			await t.mutation(api.lib.remove, { namespace: NS, key: "big" });
 			// Unfindable the moment remove() returns, orphaned postings or not.
 			const middle = Array.from(text).slice(2000, 2005).join("");
@@ -535,14 +829,81 @@ describe("deferred reaping", () => {
 		}
 	}, 60_000);
 
+	test("renaming the Field of a max-size text retags in the reaper; search ignores the stale tags meanwhile", async () => {
+		vi.useFakeTimers();
+		try {
+			const t = initConvexTest();
+			const text = bigText(4096);
+			const middle = Array.from(text).slice(2000, 2005).join("");
+			await t.mutation(api.lib.set, {
+				namespace: NS,
+				key: "big",
+				fields: [{ name: "title", value: text }],
+				sortKey: 1,
+			});
+			// 4096 tag-only patches exceed the inline limit: no throw, a retag mark instead.
+			await t.mutation(api.lib.set, {
+				namespace: NS,
+				key: "big",
+				fields: [{ name: "body", value: text }],
+				sortKey: 1,
+			});
+			const marks = () =>
+				t.run(
+					async (ctx) => (await ctx.db.query("retagging").collect()).length,
+				);
+			expect(await marks()).toBe(1);
+			const hit = [{ key: "big", sortKey: 1, matchedFields: ["body"] }];
+			expect(
+				(
+					await t.query(api.lib.search, {
+						namespace: NS,
+						query: middle,
+						fields: ["body"],
+					})
+				).page,
+			).toEqual(hit);
+			await t.finishAllScheduledFunctions(vi.runAllTimers);
+			expect(await marks()).toBe(0);
+			const stale = await t.run(
+				async (ctx) =>
+					(await ctx.db.query("postings").collect()).filter(
+						(p) => p.fields?.join() !== "body",
+					).length,
+			);
+			expect(stale).toBe(0);
+			expect(
+				(
+					await t.query(api.lib.search, {
+						namespace: NS,
+						query: middle,
+						fields: ["body"],
+					})
+				).page,
+			).toEqual(hit);
+		} finally {
+			vi.useRealTimers();
+		}
+	}, 60_000);
+
 	test("shrinking a huge text: old substrings unfindable at once, postings reaped to the new gram set", async () => {
 		vi.useFakeTimers();
 		try {
 			const t = initConvexTest();
 			const text = bigText(4096);
-			await t.mutation(api.lib.set, { namespace: NS, key: "big", fields: asFields(text), sortKey: 1 });
+			await t.mutation(api.lib.set, {
+				namespace: NS,
+				key: "big",
+				fields: asFields(text),
+				sortKey: 1,
+			});
 			const middle = Array.from(text).slice(2000, 2005).join("");
-			await t.mutation(api.lib.set, { namespace: NS, key: "big", fields: asFields("停車場"), sortKey: 1 });
+			await t.mutation(api.lib.set, {
+				namespace: NS,
+				key: "big",
+				fields: asFields("停車場"),
+				sortKey: 1,
+			});
 			expect(await searchAll(t, middle)).toEqual([]);
 			expect(await searchAll(t, "停車場")).toEqual(["big"]);
 			await t.finishAllScheduledFunctions(vi.runAllTimers);
@@ -564,13 +925,28 @@ describe("deferred reaping", () => {
 	test("sortKey change on a multi-thousand-gram text is refused; text edits are not", async () => {
 		const t = initConvexTest();
 		const text = bigText(4096);
-		await t.mutation(api.lib.set, { namespace: NS, key: "big", fields: asFields(text), sortKey: 1 });
+		await t.mutation(api.lib.set, {
+			namespace: NS,
+			key: "big",
+			fields: asFields(text),
+			sortKey: 1,
+		});
 		await expect(
-			t.mutation(api.lib.set, { namespace: NS, key: "big", fields: asFields(text), sortKey: 2 }),
+			t.mutation(api.lib.set, {
+				namespace: NS,
+				key: "big",
+				fields: asFields(text),
+				sortKey: 2,
+			}),
 		).rejects.toThrow(/sortKey/);
 		// Same sortKey, edited text: fine — this is the supported shape.
 		const edited = `${Array.from(text).slice(0, 4090).join("")}停車場費用又`;
-		await t.mutation(api.lib.set, { namespace: NS, key: "big", fields: asFields(edited), sortKey: 1 });
+		await t.mutation(api.lib.set, {
+			namespace: NS,
+			key: "big",
+			fields: asFields(edited),
+			sortKey: 1,
+		});
 		expect(await searchAll(t, "停車場費用")).toEqual(["big"]);
 	}, 60_000);
 });
@@ -578,14 +954,22 @@ describe("deferred reaping", () => {
 describe("clearNamespace", () => {
 	test("a namespace holding a max-size document clears across batches", async () => {
 		const t = initConvexTest();
-		await t.mutation(api.lib.set, { namespace: NS, key: "big", fields: asFields(bigText(4096)), sortKey: 1 });
+		await t.mutation(api.lib.set, {
+			namespace: NS,
+			key: "big",
+			fields: asFields(bigText(4096)),
+			sortKey: 1,
+		});
 		let cursor: string | null = null;
 		let calls = 0;
 		do {
-			const result: { cursor: string | null } = await t.mutation(api.lib.clearNamespace, {
-				namespace: NS,
-				cursor,
-			});
+			const result: { cursor: string | null } = await t.mutation(
+				api.lib.clearNamespace,
+				{
+					namespace: NS,
+					cursor,
+				},
+			);
 			cursor = result.cursor;
 			calls += 1;
 		} while (cursor !== null && calls < 100);
@@ -609,13 +993,21 @@ describe("clearNamespace", () => {
 				sortKey: i,
 			})),
 		);
-		await t.mutation(api.lib.set, { namespace: "other", key: "x", fields: asFields("停車"), sortKey: 1 });
+		await t.mutation(api.lib.set, {
+			namespace: "other",
+			key: "x",
+			fields: asFields("停車"),
+			sortKey: 1,
+		});
 		let cursor: string | null = null;
 		for (let i = 0; i < 100; i++) {
-			const result: { cursor: string | null } = await t.mutation(api.lib.clearNamespace, {
-				namespace: NS,
-				cursor,
-			});
+			const result: { cursor: string | null } = await t.mutation(
+				api.lib.clearNamespace,
+				{
+					namespace: NS,
+					cursor,
+				},
+			);
 			cursor = result.cursor;
 			if (cursor === null) break;
 		}
@@ -624,5 +1016,50 @@ describe("clearNamespace", () => {
 		// other namespaces untouched
 		const other = await t.query(api.lib.get, { namespace: "other", key: "x" });
 		expect(other).not.toBeNull();
+	});
+});
+
+describe("namespaceBefore", () => {
+	test("steps down through the namespaces under a prefix that hold Entries", async () => {
+		const t = initConvexTest();
+		for (const namespace of [
+			"r/2026Q1",
+			"r/2026Q3",
+			"r/2025Q4",
+			"r",
+			"rx/2026Q4",
+			"s/2027Q1",
+		]) {
+			for (const key of ["a", "b", "c"]) {
+				await t.mutation(api.lib.set, {
+					namespace,
+					key,
+					fields: asFields("停車"),
+					sortKey: 1,
+				});
+			}
+		}
+		await t.mutation(api.lib.remove, { namespace: "r/2025Q4", key: "a" });
+		await t.mutation(api.lib.set, {
+			namespace: "r/2024Q1",
+			key: "gone",
+			fields: asFields("x"),
+			sortKey: 1,
+		});
+		await t.mutation(api.lib.remove, { namespace: "r/2024Q1", key: "gone" });
+
+		const seen: string[] = [];
+		let before: string | undefined;
+		for (;;) {
+			const namespace = await t.query(api.lib.namespaceBefore, {
+				prefix: "r/",
+				before,
+			});
+			if (namespace === null) break;
+			seen.push(namespace);
+			before = namespace;
+		}
+		// An emptied namespace drops out; "r", "rx/…" and "s/…" never match.
+		expect(seen).toEqual(["r/2026Q3", "r/2026Q1", "r/2025Q4"]);
 	});
 });

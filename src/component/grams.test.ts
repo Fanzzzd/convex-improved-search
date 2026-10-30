@@ -28,9 +28,7 @@ describe("documentGrams", () => {
 		expect(documentGrams("aaaa")).toEqual(new Set(["aa", `a${SENTINEL}`]));
 	});
 	test("whitespace and punctuation participate like any codepoint", () => {
-		expect(documentGrams("a b")).toEqual(
-			new Set(["a ", " b", `b${SENTINEL}`]),
-		);
+		expect(documentGrams("a b")).toEqual(new Set(["a ", " b", `b${SENTINEL}`]));
 	});
 	test("surrogate pairs are single codepoints", () => {
 		// 😀 is U+1F600 (two UTF-16 code units).

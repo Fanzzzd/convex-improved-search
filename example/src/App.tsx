@@ -27,11 +27,18 @@ function App() {
 	};
 
 	return (
-		<div style={{ maxWidth: 640, margin: "0 auto", padding: "2rem", textAlign: "left" }}>
+		<div
+			style={{
+				maxWidth: 640,
+				margin: "0 auto",
+				padding: "2rem",
+				textAlign: "left",
+			}}
+		>
 			<h1>convex-improved-search</h1>
 			<p style={{ opacity: 0.7 }}>
-				Exact substring search that works for CJK — try adding notes in
-				Chinese and searching any two characters from the middle.
+				Exact substring search that works for CJK — try adding notes in Chinese
+				and searching any two characters from the middle.
 			</p>
 
 			<div style={{ display: "flex", gap: "0.5rem", marginBottom: "1rem" }}>
@@ -84,8 +91,12 @@ function App() {
 						}}
 					>
 						<span style={{ flex: 1 }}>{note.text}</span>
-						<span style={{ opacity: 0.6, fontSize: "0.8rem" }}>{note.category}</span>
-						<button onClick={() => void deleteNote({ noteId: note._id })}>×</button>
+						<span style={{ opacity: 0.6, fontSize: "0.8rem" }}>
+							{note.category}
+						</span>
+						<button onClick={() => void deleteNote({ noteId: note._id })}>
+							×
+						</button>
 					</li>
 				))}
 			</ul>

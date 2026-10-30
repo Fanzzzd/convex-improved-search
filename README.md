@@ -9,30 +9,30 @@ Convex's built-in [full text search](https://docs.convex.dev/search/text-search)
 tokenizes on whitespace and punctuation and "works best with English or other
 Latin-script languages". For Chinese, Japanese, Korean, Thai — or simply for
 `LIKE '%…%'`-style substring matching in any language — it structurally cannot
-help: a run of CJK text becomes a single token, and terms over 32 bytes
-(≈11 CJK characters) are silently dropped from the index entirely.
+help: a run of CJK text becomes a single token, and terms over 32 bytes (≈11 CJK
+characters) are silently dropped from the index entirely.
 
 This component fills that gap with a bigram inverted index that lives in
 ordinary Convex tables:
 
-- **Exact substring semantics.** The result set is provably identical to
-  "some field of the document contains the query" (after folding) — the
-  index only accelerates, it never approximates. Verified by a randomized
-  differential test suite against a naive-scan oracle.
+- **Exact substring semantics.** The result set is provably identical to "some
+  field of the document contains the query" (after folding) — the index only
+  accelerates, it never approximates. Verified by a randomized differential test
+  suite against a naive-scan oracle.
 - **Any language.** Bigrams over folded codepoints — no tokenizer, no
   dictionary, no language configuration. A two-character Chinese query is a
   single index point-lookup.
-- **Multi-field.** Index named fields (`note`, `cargo`, …); a match never
-  spans a field boundary, and every hit reports `matchedFields` — which
-  fields contained the query — for free.
-- **Transactional.** One table, one mapper: `tableIndexer` keeps the index
-  in the same transaction as your writes, with backfill and triggers driven
-  by the same mapper. No drift window, ever.
+- **Multi-field.** Index named fields (`note`, `cargo`, …); a match never spans
+  a field boundary, and every hit reports `matchedFields` — which fields
+  contained the query — for free.
+- **Transactional.** One table, one mapper: `tableIndexer` keeps the index in
+  the same transaction as your writes, with backfill and triggers driven by the
+  same mapper. No drift window, ever.
 - **Reactive.** Search from a normal Convex query and results update live.
-- **Unicode-sane.** NFKC + lowercase folding: full-width `ＡＢＣ１２３`
-  matches `abc123`, decomposed and precomposed accents match each other,
-  surrogate pairs are handled per-codepoint. Exported highlight utilities
-  map folded matches back to original-text offsets.
+- **Unicode-sane.** NFKC + lowercase folding: full-width `ＡＢＣ１２３` matches
+  `abc123`, decomposed and precomposed accents match each other, surrogate pairs
+  are handled per-codepoint. Exported highlight utilities map folded matches
+  back to original-text offsets.
 
 ## Installation
 
@@ -52,8 +52,8 @@ export default app;
 
 ## Usage
 
-One `SearchIndex` per logical collection, one `tableIndexer` binding it to
-a table with one mapper:
+One `SearchIndex` per logical collection, one `tableIndexer` binding it to a
+table with one mapper:
 
 ```ts
 // convex/search.ts
@@ -85,14 +85,17 @@ related rows, aggregate, whatever; the index still updates atomically.
 
 ### Writing
 
-Call `sync` after any write, in the same mutation — it reads the row and
-upserts or removes the entry, hard deletes included:
+Call `sync` after any write, in the same mutation — it reads the row and upserts
+or removes the entry, hard deletes included:
 
 ```ts
 export const addNote = mutation({
   args: { title: v.string(), body: v.string() },
   handler: async (ctx, args) => {
-    const noteId = await ctx.db.insert("notes", { ...args, createdAt: Date.now() });
+    const noteId = await ctx.db.insert("notes", {
+      ...args,
+      createdAt: Date.now(),
+    });
     await notesIndexer.sync(ctx, noteId); // same transaction — the index can never drift
     return noteId;
   },
@@ -107,9 +110,9 @@ export const deleteNote = mutation({
 });
 ```
 
-Updates pay only the gram *diff* — re-syncing a document with slightly
-changed text writes a handful of rows, not thousands. `syncMany(ctx, ids)`
-covers writes that touch a batch of rows at once.
+Updates pay only the gram _diff_ — re-syncing a document with slightly changed
+text writes a handful of rows, not thousands. `syncMany(ctx, ids)` covers writes
+that touch a batch of rows at once.
 
 (You can also call `notesSearch.set` / `notesSearch.remove` directly — the
 indexer is sugar over them, not a requirement.)
@@ -120,15 +123,21 @@ indexer is sugar over them, not a requirement.)
 
 ```ts
 export const searchNotes = query({
-  args: { query: v.string(), cursor: v.optional(v.union(v.string(), v.null())) },
+  args: {
+    query: v.string(),
+    cursor: v.optional(v.union(v.string(), v.null())),
+  },
   handler: async (ctx, args) => {
-    const { page, cursor, isDone } = await notesSearch.searchDocs<Doc<"notes">>(ctx, {
-      table: "notes",
-      query: args.query, // "停車" — any substring, any language
-      filters: { category: "work" }, // optional exact-match filters
-      cursor: args.cursor,
-      limit: 50,
-    });
+    const { page, cursor, isDone } = await notesSearch.searchDocs<Doc<"notes">>(
+      ctx,
+      {
+        table: "notes",
+        query: args.query, // "停車" — any substring, any language
+        filters: { category: "work" }, // optional exact-match filters
+        cursor: args.cursor,
+        limit: 50,
+      },
+    );
     // page: [{ doc, sortKey, matchedFields }] newest-first
     return { page, cursor, isDone };
   },
@@ -138,23 +147,37 @@ export const searchNotes = query({
 `matchedFields` names the fields whose text contained the query (for a
 single-string entry it is `["text"]`) — exact, straight from the verifier.
 
-Plain `search` returns `{ key, sortKey, matchedFields }` hits without
-hydration, for keys that are not document ids. `searchPaginated` /
-`searchDocsPaginated` speak Convex's standard `paginationOpts` /
-`{ page, isDone, continueCursor }` shape for paginated-query clients.
+Plain `search` returns `{ key, sortKey, matchedFields }` hits without hydration,
+for keys that are not document ids. `searchPaginated` / `searchDocsPaginated`
+speak Convex's standard `paginationOpts` / `{ page, isDone, continueCursor }`
+shape for paginated-query clients.
 
 > **Pagination contract:** a non-null `cursor` with a short — or even empty —
 > `page` means the scan budget ran out before the page filled (e.g. a very
-> selective filter over a common substring). Keep paging; matches keep
-> arriving. Only `isDone: true` means the search is exhausted. If you render
-> pages incrementally, auto-continue while the page is empty.
+> selective filter over a common substring). Keep paging; matches keep arriving.
+> Only `isDone: true` means the search is exhausted. If you render pages
+> incrementally, auto-continue while the page is empty.
+
+To search only some fields, pass `fields`. Hits whose query occurrence lies only
+in other fields are dropped inside the component, and `matchedFields` lists only
+the named fields. Prefer it over filtering `matchedFields` yourself. Each
+posting row records which fields hold its gram, so the component drops most
+other-field candidates before reading their document. Those candidates cost no
+index range and no scan budget.
+
+```ts
+await reimbursementsSearch.search(ctx, {
+  query: "TR-260720-006",
+  fields: ["no"],
+});
+```
 
 To get "up to N matches" in one query without writing that loop, pass
 `fill: true`. The call keeps paging until the page holds `limit` hits, the
-search is done, or 768 candidates have been scanned in total (`budget`
-lowers that cap). `searchDocs` counts a hit whose document is gone as a
-miss and keeps going. The cursor contract is unchanged, so a filled page
-can still come back short with a non-null cursor:
+search is done, or 768 candidates have been scanned in total (`budget` lowers
+that cap). `searchDocs` counts a hit whose document is gone as a miss and keeps
+going. The cursor contract is unchanged, so a filled page can still come back
+short with a non-null cursor:
 
 ```ts
 const { page } = await notesSearch.searchDocs<Doc<"notes">>(ctx, {
@@ -177,25 +200,34 @@ matchSegments("停車場月租 ＡＢＣ大樓", "abc");
 // [{ text: "停車場月租 ", match: false }, { text: "ＡＢＣ", match: true }, { text: "大樓", match: false }]
 
 // React:
-{matchSegments(note.title, query).map((seg, i) =>
-  seg.match ? <mark key={i}>{seg.text}</mark> : <span key={i}>{seg.text}</span>
-)}
+{
+  matchSegments(note.title, query).map((seg, i) =>
+    seg.match ? (
+      <mark key={i}>{seg.text}</mark>
+    ) : (
+      <span key={i}>{seg.text}</span>
+    ),
+  );
+}
 ```
 
-`findFoldedRange(text, query)` returns the raw `[start, end)` UTF-16 range
-(or `null` when the occurrence cannot be located — render unhighlighted).
-Use `matchedFields` to decide *which* field to highlight.
+`findFoldedRange(text, query)` returns the raw `[start, end)` UTF-16 range (or
+`null` when the occurrence cannot be located — render unhighlighted). Use
+`matchedFields` to decide _which_ field to highlight.
 
 ## Keeping the index in sync
 
 ### Triggers (zero drift)
 
-With [`convex-helpers/server/triggers`](https://stack.convex.dev/triggers)
-every write to the table syncs automatically, driven by the same mapper:
+With [`convex-helpers/server/triggers`](https://stack.convex.dev/triggers) every
+write to the table syncs automatically, driven by the same mapper:
 
 ```ts
 import { Triggers } from "convex-helpers/server/triggers";
-import { customMutation, customCtx } from "convex-helpers/server/customFunctions";
+import {
+  customMutation,
+  customCtx,
+} from "convex-helpers/server/customFunctions";
 
 const triggers = new Triggers<DataModel>();
 triggers.register("notes", notesIndexer.trigger());
@@ -203,8 +235,8 @@ export const mutation = customMutation(rawMutation, customCtx(triggers.wrapDB));
 ```
 
 Caveat (inherited from triggers itself): writes from the dashboard and
-`npx convex import` bypass wrapped mutations. If you use those, run the
-backfill recipe afterwards.
+`npx convex import` bypass wrapped mutations. If you use those, run the backfill
+recipe afterwards.
 
 ### Backfilling existing data
 
@@ -221,121 +253,195 @@ export const backfillSearch = migrations.define({
 });
 ```
 
-To inspect what the index believes about one key, `notesSearch.get(ctx,
-{ key })` returns its folded `fields`, `sortKey` and `filters`. To drop a
-whole namespace:
+To inspect what the index believes about one key,
+`notesSearch.get(ctx, { key })` returns its folded `fields`, `sortKey` and
+`filters`. To drop a whole namespace:
 
 ```ts
 let cursor: string | null = null;
-do { ({ cursor } = await notesSearch.clear(ctx, { cursor })); } while (cursor !== null);
+do {
+  ({ cursor } = await notesSearch.clear(ctx, { cursor }));
+} while (cursor !== null);
 ```
 
 ### Scaling out: time shards
 
-Past ~100k entries per namespace, partition by time with
-`ShardedSearchIndex` — one namespace per shard (`receipts/2026Q3`), created
-lazily on first write, pre-indexable ahead of a cutover with the ordinary
-backfill recipe, droppable per shard via `clear`:
+Past ~100k entries per namespace, partition by time with `ShardedSearchIndex`.
+Each shard is its own namespace (`receipts/2026Q3`). It is created on its first
+write, can be indexed ahead of a cutover with the ordinary backfill recipe, and
+can be dropped with `clear`.
+
+With a `period` (`"month"`, `"quarter"` or `"year"`), the shard comes from the
+`sortKey`, which must be a timestamp in ms. Periods are in UTC.
 
 ```ts
 export const receipts = new ShardedSearchIndex(components.improvedSearch, {
   name: "receipts",
+  period: "quarter",
   filterFields: ["source"],
 });
-const shardOf = (createdAt: number) => {
-  const d = new Date(createdAt);
-  return `${d.getUTCFullYear()}Q${Math.floor(d.getUTCMonth() / 3) + 1}`;
-};
 
 // Writes (or receipts.trigger((ctx, doc) => …) with the same shape):
 await receipts.set(ctx, {
-  key: doc._id, text: doc.note, sortKey: doc.createdAt,
-  shard: shardOf(doc.createdAt),
+  key: doc._id,
+  text: doc.note,
+  sortKey: doc.createdAt,
 });
 
-// Reads: pass the live shard list, newest first.
-const page = await receipts.search(ctx, {
+// Every shard that holds entries, newest first:
+const page = await receipts.search(ctx, { query: "停車" });
+
+// Only the last 90 days (pass `now` in; queries must not read the clock):
+const recent = await receipts.search(ctx, {
+  query: "停車",
+  shards: receipts.shardsBetween(args.now, args.now - 90 * 24 * 3600 * 1000),
+});
+```
+
+Without `shards`, the search finds the next shard with one index range, so empty
+periods cost nothing. `shardsBetween` works at shard grain: the oldest and
+newest shard can return hits a little outside the range.
+
+Sharding bounds the cost when a search is limited to recent shards. A search
+over every shard reads about what one large namespace would. A query whose every
+gram is in most entries (shared prefixes such as `TR-26`) still reads every
+shard to finish, so limit such searches by time.
+
+Without a `period`, name the shard yourself and pass the shard list, newest
+first:
+
+```ts
+await receipts.set(ctx, { ...entry, shard: "2026Q3" });
+await receipts.search(ctx, {
   shards: ["2026Q3", "2026Q2", "2026Q1"],
   query: "停車",
 });
 ```
 
-The contract: derive the shard from the `sortKey`, so shard ranges are
-disjoint and newest-first shard order makes concatenated results globally
-sorted. Recent-first UIs get their answers from the first shard at a
-fraction of the cost; paging naturally continues into older shards
-(same cursor contract as `SearchIndex.search`).
+The contract: derive the shard from the `sortKey`, so shard ranges are disjoint
+and newest-first shard order makes concatenated results globally sorted. Paging
+continues into older shards with the same cursor contract as
+`SearchIndex.search`.
 
 ## How it works
 
 - Each field's text is folded (`NFKC` + `toLowerCase`) and split into
-  overlapping **bigrams of codepoints**, with an end-of-text sentinel per
-  field so every character starts exactly one gram and no gram spans a
-  field boundary. One posting row per distinct gram of the entry.
-- A query folds identically. Two-codepoint queries are one index point-lookup;
-  longer queries stream the scarcest gram (chosen by probing) and reject
-  candidates via point-lookups on the others; single-codepoint queries use a
-  first-codepoint index. **Every candidate is then verified per field with
-  `folded.includes(query)`** — the index is a pure candidate filter, so
-  correctness never depends on the gram approximation (the same structural
-  argument SQLite's FTS5 trigram tokenizer relies on), and `matchedFields`
-  is the verifier's own answer.
-- Design lineage: SQLite FTS5 trigram tokenizer (spec), pg_bigm (gram size 2
-  for CJK), Lucene `TestNGramTokenizer` and SQLancer NoREC (differential
-  testing methodology).
+  overlapping **bigrams of codepoints**, with an end-of-text sentinel per field
+  so every character starts exactly one gram and no gram spans a field boundary.
+  One posting row per distinct gram of the entry, tagged with the fields that
+  hold the gram.
+- A query folds identically. Two-codepoint queries stream one gram. Longer
+  queries stream the scarcest gram (chosen by probing) and merge-join up to
+  three others against it in index order. A candidate reaches its document only
+  if it holds those grams and some wanted field holds all of them.
+  Single-codepoint queries use a first-codepoint index. Documents are walked by
+  a (sortKey, key) index in step with the candidates. When most documents are
+  candidates anyway, the call walks the documents alone. **Every candidate is
+  then verified per field with `folded.includes(query)`** — the index is a pure
+  candidate filter, so correctness never depends on the gram approximation (the
+  same structural argument SQLite's FTS5 trigram tokenizer relies on), and
+  `matchedFields` is the verifier's own answer.
+- Design lineage: SQLite FTS5 trigram tokenizer (spec), pg_bigm (gram size 2 for
+  CJK), Lucene `TestNGramTokenizer` and SQLancer NoREC (differential testing
+  methodology).
 
 ## Limits
 
-- **Text**: up to **4096 codepoints** per entry after folding, shared
-  across its fields in field order. Longer text is truncated by default
-  (the overflowing field is cut, later fields dropped; substrings beyond
-  the limit are unfindable); pass `onOverflow: "error"` to throw instead.
-  The write path is engineered so a full-size entry indexes within one
-  Convex transaction — but avoid writing *several* max-size entries in a
-  single mutation.
+- **Text**: up to **4096 codepoints** per entry after folding, shared across its
+  fields in field order. Longer text is truncated by default (the overflowing
+  field is cut, later fields dropped; substrings beyond the limit are
+  unfindable); pass `onOverflow: "error"` to throw instead. The write path is
+  engineered so a full-size entry indexes within one Convex transaction — but
+  avoid writing _several_ max-size entries in a single mutation.
 - **Deletes are lazy**: `remove` (and large shrinking edits) make the entry
-  unfindable immediately, but posting cleanup beyond a small inline budget
-  runs in a component-internal scheduled mutation moments later. Until it
-  runs, leftover postings are only rejected candidates — never wrong
-  results. (Convex counts deletes as reads, 4096/transaction, so a max-size
-  entry cannot be unindexed synchronously.)
-- **Writes**: `set` compares the new entry with the stored one first. When
-  the folded text and `sortKey` are unchanged it skips the posting diff, so
-  re-syncing an unchanged document or changing only its filters costs one
-  row read and at most one row write.
+  unfindable immediately, but posting cleanup beyond a small inline budget runs
+  in a component-internal scheduled mutation moments later. Until it runs,
+  leftover postings are only rejected candidates — never wrong results. (Convex
+  counts deletes as reads, 4096/transaction, so a max-size entry cannot be
+  unindexed synchronously.)
+- **Writes**: `set` compares the new entry with the stored one first. When the
+  folded text and `sortKey` are unchanged it skips the posting diff, so
+  re-syncing an unchanged document or changing only its filters costs two row
+  reads (the entry and one of its postings, to check its Field tags) and at most
+  one row write.
 - **Ordering**: `sortKey` descending only. Changing an entry's `sortKey`
-  rewrites all its posting rows synchronously; a change touching more than
-  3000 surviving grams is refused. Prefer stable sort keys (creation time).
-- **Filters**: exact-match only, post-filtering. Highly selective filters
-  over very common substrings consume scan budget — raise `budget` if needed.
+  rewrites all its posting rows synchronously; a change touching more than 3000
+  surviving grams is refused. Prefer stable sort keys (creation time).
+- **Filters**: exact-match only, checked on the document. Documents are read in
+  the same order as candidates, so a filter that keeps 1 in 100 over a common
+  substring costs about 100 streamed rows per hit and few index ranges. Each
+  rejected candidate still counts against `budget`, so such a page often comes
+  back short with a cursor. When one filter value selects a small slice you
+  search often (a tenant, an archive flag), give it its own namespace.
+- **Read cost**: one `search` call probes up to 16 of the query's grams, streams
+  the sparsest, and merge-joins the next three against it, so a rejected
+  candidate costs streamed rows, not index ranges. Surviving candidates are
+  checked against their documents, read by walking the documents in the same
+  order: dense hits cost rows, and a far-apart hit costs one index range. When
+  the postings and documents read come to as much per document as reading every
+  document would (a dense query, or grams split across fields), the call walks
+  the documents alone instead: about one row, text included, per document
+  passed. It switches back once the grams thin out. The cursor carries the
+  chosen grams, or that it was walking documents, so the next page skips
+  probing. `budget` caps the documents checked per call (default 256, max 768).
+  Every call in one transaction shares Convex's limits (4096 index ranges, 32000
+  rows, 16 MiB read, and 15 s of total database time) with your own reads and
+  with every other `search` in it. Each call checks what the transaction has
+  left, keeps 512 ranges, 4096 rows and 2 MiB for you, and otherwise returns a
+  short page with a cursor. If your reads have already reached the reserve,
+  search reads nothing and returns a cursor to retry in a fresh transaction. The
+  15 s limit cannot be measured from inside the query, so the reserve does not
+  cover it. Calling `search` in a loop inside one query therefore adds up; use
+  `fill: true` and `fields` instead, and page further from the client.
+- **Exact identifiers**: to look up a whole document number, an equality index
+  on your own table answers in one index range. Substring search is for partial
+  numbers and free text.
 - **Scale**: designed for up to ~100k documents per namespace. Storage is
-  roughly one small row per character of indexed text. Beyond that,
-  partition by time with `ShardedSearchIndex` (see above).
+  roughly one small row per character of indexed text. Beyond that, partition by
+  time with `ShardedSearchIndex` (see above).
 - **Traditional vs Simplified Chinese**: NFKC folds width and compatibility
-  forms but does NOT map Simplified↔Traditional — `台` will not match `臺`.
-  If you need that, pre-fold your text (and queries) with a kVariant table
-  (e.g. the IRG kVariants data) before calling `set`/`search`; an opt-in
-  fold option is on the roadmap.
+  forms but does NOT map Simplified↔Traditional — `台` will not match `臺`. If
+  you need that, pre-fold your text (and queries) with a kVariant table (e.g.
+  the IRG kVariants data) before calling `set`/`search`; an opt-in fold option
+  is on the roadmap.
+
+## Upgrading to 0.5.0
+
+- Posting rows gain an optional `fields` tag. Rows written by earlier versions
+  have none. Search still returns the same results for them; it only cannot drop
+  their other-field candidates early. Re-run your backfill (`syncDoc`/`set`)
+  once to tag them: `set` reads one posting of an unchanged entry, sees the
+  missing tag, and rewrites the tags. Entries you write after the upgrade are
+  tagged as they are written.
+- `docs` gains the index `by_ns_sort`. Convex builds it on deploy; there is
+  nothing to run.
+- The component's `search` result gains `verified`: candidates checked against
+  their documents, at most `budget`. `scanned` still counts distinct candidates
+  examined, but most of them are now rejected by their postings alone, so it can
+  exceed `budget`. A loop that caps its cost should count `verified`. Prefer
+  `fill: true` and `fields` over such loops.
 
 ## Upgrading from 0.1.x
 
 - **Storage shape changed** (single folded text → named fields), and Convex
   validates existing rows against the component schema at push time — a
-  deployment still holding 0.1.x index data will refuse the push. Clear
-  every namespace on 0.1.x first (the `clear` loop above), then upgrade and
-  re-run your backfill (`syncDoc`/`set` are idempotent).
-- `SearchIndex.trigger(mapper)` is gone — bind a `tableIndexer({ table,
-  map })` and use `indexer.trigger()`. The mapper now receives `(ctx, doc)`;
-  so does `ShardedSearchIndex.trigger`'s.
+  deployment still holding 0.1.x index data will refuse the push. Clear every
+  namespace on 0.1.x first (the `clear` loop above), then upgrade and re-run
+  your backfill (`syncDoc`/`set` are idempotent).
+- `SearchIndex.trigger(mapper)` is gone — bind a `tableIndexer({ table, map })`
+  and use `indexer.trigger()`. The mapper now receives `(ctx, doc)`; so does
+  `ShardedSearchIndex.trigger`'s.
 - `get` returns `{ fields, sortKey, filters }` instead of `foldedText`.
 
 ## Development
 
 ```bash
 npm install
-npm run test        # 81 tests incl. randomized differential suite
+npm run test        # randomized differential suites included
+CIS_BENCH=1 npx vitest run src/component/cost.bench.test.ts  # read-cost benchmark
 npm run typecheck
 npm run lint
+npm run format:check
 ```
 
 A runnable demo lives in [example/](./example/) — a Vite + React app.
@@ -343,18 +449,17 @@ A runnable demo lives in [example/](./example/) — a Vite + React app.
 ### Releasing
 
 Conventional commits drive the pipeline: `feat` / `fix` (and breaking `!`)
-commits on `main` make [release-please](https://github.com/googleapis/release-please)
-open or refresh a release PR with the version bump and changelog. Merging
-that PR tags the release; the workflow then rebuilds, re-runs the full
-test gate, and publishes to npm via
-[trusted publishing](https://docs.npmjs.com/trusted-publishers) (GitHub
-OIDC — no tokens, provenance included). A failed publish should first be
+commits on `main` make
+[release-please](https://github.com/googleapis/release-please) open or refresh a
+release PR with the version bump and changelog. Merging that PR tags the
+release; the workflow then rebuilds, re-runs the full test gate, and publishes
+to npm via [trusted publishing](https://docs.npmjs.com/trusted-publishers)
+(GitHub OIDC — no tokens, provenance included). A failed publish should first be
 rerun from GitHub Actions. If the rerun window has expired, manually dispatch
 the same `Release` workflow with the existing immutable tag; the job verifies
-that the tag and package version agree before publishing.
-Caveat: the release PR itself doesn't trigger the PR test workflow
-(GitHub doesn't run workflows on `GITHUB_TOKEN`-created PRs); the publish
-job's own gate covers it.
+that the tag and package version agree before publishing. Caveat: the release PR
+itself doesn't trigger the PR test workflow (GitHub doesn't run workflows on
+`GITHUB_TOKEN`-created PRs); the publish job's own gate covers it.
 
 ## License
 

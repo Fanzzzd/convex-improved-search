@@ -33,7 +33,10 @@ export const addNote = mutation({
 		category: v.union(v.literal("work"), v.literal("personal")),
 	},
 	handler: async (ctx, args) => {
-		const noteId = await ctx.db.insert("notes", { ...args, createdAt: Date.now() });
+		const noteId = await ctx.db.insert("notes", {
+			...args,
+			createdAt: Date.now(),
+		});
 		// Same transaction as the insert — the index can never drift.
 		await notesIndexer.sync(ctx, noteId);
 		return noteId;
@@ -72,7 +75,8 @@ export const searchNotes = query({
 		const result = await notesSearch.searchDocs<Doc<"notes">>(ctx, {
 			table: "notes",
 			query: args.query,
-			filters: args.category === undefined ? undefined : { category: args.category },
+			filters:
+				args.category === undefined ? undefined : { category: args.category },
 			cursor: args.cursor,
 			limit: 20,
 		});
@@ -92,6 +96,10 @@ export const listNotes = query({
 	args: {},
 	handler: async (ctx) => {
 		const notes = await ctx.db.query("notes").order("desc").take(50);
-		return notes.map((note) => ({ _id: note._id, text: note.text, category: note.category }));
+		return notes.map((note) => ({
+			_id: note._id,
+			text: note.text,
+			category: note.category,
+		}));
 	},
 });

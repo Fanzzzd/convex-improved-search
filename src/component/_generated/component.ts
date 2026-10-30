@@ -42,6 +42,13 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         } | null,
         Name
       >;
+      namespaceBefore: FunctionReference<
+        "query",
+        "internal",
+        { before?: string; prefix: string },
+        string | null,
+        Name
+      >;
       remove: FunctionReference<
         "mutation",
         "internal",
@@ -55,6 +62,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           budget?: number;
           cursor?: string | null;
+          fields?: Array<string>;
           filters?: Record<string, string | number | boolean | null>;
           limit?: number;
           namespace: string;
@@ -65,6 +73,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           isDone: boolean;
           page: Array<{ key: string; matchedFields: Array<string>; sortKey: number }>;
           scanned: number;
+          verified: number;
         },
         Name
       >;

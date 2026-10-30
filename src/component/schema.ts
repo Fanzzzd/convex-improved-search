@@ -31,14 +31,17 @@ export default defineSchema({
 		fields: foldedFieldsValidator,
 		sortKey: v.number(),
 		filters: v.optional(filtersValidator),
-	}).index("by_ns_key", ["namespace", "key"]),
+	})
+		.index("by_ns_key", ["namespace", "key"])
+		// Search verifies candidates by walking this in step with them.
+		.index("by_ns_sort", ["namespace", "sortKey", "key"]),
 
 	/**
 	 * Inverted index: one row per (document, distinct gram). `g1` is the
 	 * gram's first codepoint — the indexable form of single-codepoint queries
 	 * (thanks to the end sentinel, every character of a document starts
-	 * exactly one gram). `sortKey`/`filters`-independent: postings only order
-	 * candidates; truth lives in `docs`.
+	 * exactly one gram). Postings only order and pre-filter candidates;
+	 * truth lives in `docs`.
 	 *
 	 * - by_ns_gram: candidate stream for one gram, newest first.
 	 * - by_ns_g1: candidate stream for single-codepoint queries (may contain
@@ -52,8 +55,25 @@ export default defineSchema({
 		g1: v.string(),
 		key: v.string(),
 		sortKey: v.number(),
+		/**
+		 * The Fields whose text contains this gram, sorted. Search drops a
+		 * candidate whose grams share no wanted Field before reading its doc.
+		 * Absent on postings written before 0.5.0: such a posting allows every
+		 * Field, and the next `set` of its entry adds the tag.
+		 */
+		fields: v.optional(v.array(v.string())),
 	})
 		.index("by_ns_gram", ["namespace", "gram", "sortKey", "key"])
 		.index("by_ns_g1", ["namespace", "g1", "sortKey", "key"])
 		.index("by_ns_key", ["namespace", "key", "gram"]),
+
+	/**
+	 * Entries whose posting tags `set` could not rewrite inline (a Field
+	 * rename over thousands of grams). Search treats their postings as
+	 * untagged until `reapKey` has retagged them all and deletes the row.
+	 */
+	retagging: defineTable({
+		namespace: v.string(),
+		key: v.string(),
+	}).index("by_ns_key", ["namespace", "key"]),
 });
