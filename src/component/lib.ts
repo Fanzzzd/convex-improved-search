@@ -66,8 +66,13 @@ const LEAP_ROWS = 16;
  * pages of 7, 16 rows cost 4 more ranges than 0.4.0 over the drain.
  */
 const RESUME_ROWS = 64;
-/** The same, for the docs stream: doc rows are larger, so it reopens sooner. */
-const DOC_LEAP_ROWS = 8;
+/**
+ * The same, for the docs stream. A reopen at the candidate reads its doc
+ * first, so every walked row past the second costs more bytes than the
+ * reopen saves: walks of 8, 4, 2 and 1 cost W1 168968, 144344, 132032 and
+ * 125876 bytes, but 1 reads 5.7% more rows on W21 (block 160).
+ */
+const DOC_LEAP_ROWS = 2;
 const MIN_STREAM_ROWS = 64;
 const MAX_STREAM_ROWS = 4096;
 /** Transaction headroom every call leaves for the caller (hydration, its own reads). */
@@ -812,10 +817,13 @@ export const search = query({
 			load: readLoad(callBudget.rowsRead, callBudget.bytesRead),
 		});
 		let since = mark();
-		// Per window of docs in docs mode: how many hold each sampled gram,
-		// how many hold all of them in one wanted Field (`dense`), and the rows
-		// postings mode's docs walk would read to reach those (`walk`: from
-		// each, at most DOC_LEAP_ROWS to the next; `gap` docs since the last).
+		// Per window of docs in docs mode: how many hold each sampled gram in
+		// any Field (a gram's stream holds them all), how many hold all of
+		// them in one Field (`dense`), a wanted one once the call has read a
+		// tagged posting (tags reject the rest), and the rows postings mode's
+		// docs walk would read to reach those (`walk`: from each, at most
+		// DOC_LEAP_ROWS to the next; `gap` docs since the last).
+		let tagged = false;
 		const span = Math.min(SPARSE_AFTER, Math.ceil(budget / 2));
 		const tally = {
 			seen: 0,
@@ -921,10 +929,10 @@ export const search = query({
 					tally.seen += 1;
 					tally.last = doc;
 					sampled.forEach((gram, i) => {
-						if (holds(doc, [gram], fieldNames)) tally.held[i] += 1;
+						if (holds(doc, [gram], null)) tally.held[i] += 1;
 					});
 					tally.gap += 1;
-					if (holds(doc, sampled, fieldNames)) {
+					if (holds(doc, sampled, tagged ? fieldNames : null)) {
 						tally.dense += 1;
 						tally.walk += Math.min(tally.gap, DOC_LEAP_ROWS);
 						tally.gap = 0;
@@ -978,6 +986,7 @@ export const search = query({
 					more = await candidates.next();
 					continue;
 				}
+				if ("gram" in of && posting.fields !== undefined) tagged = true;
 				// g1 rows tag one gram each, not the query codepoint, so tags apply only to gram streams.
 				const nominated = await nominate(
 					posting,
