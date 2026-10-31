@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.1](https://github.com/Fanzzzd/convex-improved-search/compare/v0.5.0...v0.5.1) (2026-10-31)
+
+
+### Performance Improvements
+
+* walk 2 docs before reopening at a candidate ([a773418](https://github.com/Fanzzzd/convex-improved-search/commit/a77341884ab9a1d5e05240a311e8b14368b1f0a6))
+* walk 2 docs before reopening at a candidate ([e604659](https://github.com/Fanzzzd/convex-improved-search/commit/e6046591e7e2e84336daec72dda5750a27df659e))
+
 ## [0.5.0](https://github.com/Fanzzzd/convex-improved-search/compare/v0.4.0...v0.5.0) (2026-10-30)
 
 
