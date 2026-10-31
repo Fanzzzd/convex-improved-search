@@ -27,12 +27,12 @@ group, however many Entries share a sortKey.
 
 Walk lengths: 16 for postings, 64 for the one resume per call (an exact seek
 inside a short tie group would cost a second range when the group drains), 8 for
-docs (larger rows). A walk also ends after 16 KiB of walked rows: past a sparse
-hit among max-size docs (W12), one reopen is cheaper than eight 16 KiB rows, and
-that walk fell from 7.14 to 1.61 MB. On the W1 benchmark the postings walk at 8,
-16, 32 and 64 cost 170, 116, 97 and 93 ranges for 1662, 2183, 2786 and 3797
-rows; 16 is the last step where the ranges saved outweigh the rows added at the
-ratio of Convex's limits (4096 ranges to 32000 rows).
+docs (larger rows; 2 since ADR-0012). A walk also ends after 16 KiB of walked
+rows: past a sparse hit among max-size docs (W12), one reopen is cheaper than
+eight 16 KiB rows, and that walk fell from 7.14 to 1.61 MB. On the W1 benchmark
+the postings walk at 8, 16, 32 and 64 cost 170, 116, 97 and 93 ranges for 1662,
+2183, 2786 and 3797 rows; 16 is the last step where the ranges saved outweigh
+the rows added at the ratio of Convex's limits (4096 ranges to 32000 rows).
 
 ## Check Grams
 
