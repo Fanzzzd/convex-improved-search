@@ -8,7 +8,7 @@ import { compareValues } from "convex/values";
 import { describe, expect, test } from "vitest";
 import { api } from "./_generated/api.js";
 import { initConvexTest } from "./setup.test.js";
-import { firstCodepoint, fold, gramFieldsOf } from "./grams.js";
+import { firstCodepoint, fold, gramFieldsOf } from "../shared/grams.js";
 
 type T = ReturnType<typeof initConvexTest>;
 type Entry = { key: string; fields: Record<string, string>; sortKey: number };
@@ -447,6 +447,144 @@ describe("search over a messy index", () => {
 			expect(drained.hits).toEqual(oracle(entries, "abcx"));
 			expect(drained.maxCallRows).toBeLessThan(8000);
 			expect(drained.maxCallRanges).toBeLessThan(1024);
+		},
+	);
+
+	test(
+		"a small budget verifies a full budget of candidates per call",
+		{ timeout: 600_000 },
+		async () => {
+			// Every doc holds 停車 and 車費 apart, 1 in 40 holds 停車費: each
+			// candidate costs a range for its doc read on top of its streams.
+			const entries = Array.from({ length: 400 }, (_, i) => ({
+				key: `b${String(i).padStart(4, "0")}`,
+				fields: { text: i % 40 === 0 ? "停車費" : "停車 車費" },
+				sortKey: 400 - i,
+			}));
+			const t = initConvexTest();
+			await seed(t, entries);
+			let cursor: string | null = null;
+			const hits: string[] = [];
+			for (let call = 0; call < 400; call++) {
+				const page = await t.run(async (ctx) =>
+					ctx.runQuery(api.lib.search, {
+						namespace: NS,
+						query: "停車費",
+						limit: 2,
+						budget: 2,
+						cursor,
+					}),
+				);
+				hits.push(...page.page.map((hit) => `${hit.key}|text`));
+				if (page.isDone) break;
+				expect(
+					page.page.length === 2 || page.verified === 2,
+					`call ${call} verified ${page.verified}`,
+				).toBe(true);
+				cursor = page.cursor;
+			}
+			expect(hits).toEqual(oracle(entries, "停車費"));
+		},
+	);
+
+	test(
+		"doc reads in rounds never move the cursor past an unread candidate",
+		{ timeout: 600_000 },
+		async () => {
+			// Runs of matches (rounds grow) between runs of near misses (rounds
+			// fall back to one), in tie groups of 3, paged at every size.
+			const rand = prng(41);
+			const entries = Array.from({ length: 600 }, (_, i) => ({
+				key: `r${String(i).padStart(4, "0")}`,
+				fields: {
+					text:
+						Math.floor(i / 25) % 2 === 0 || rand() < 0.1 ? "xabcx" : "xabx bcx",
+				},
+				sortKey: Math.floor((600 - i) / 3),
+			}));
+			const t = initConvexTest();
+			await seed(t, entries);
+			const expected = oracle(entries, "abc");
+			for (const [limit, budget] of [
+				[1, 1],
+				[3, 2],
+				[7, undefined],
+				[20, 5],
+				[50, undefined],
+			] as const) {
+				const drained = await drain(t, { query: "abc", limit, budget });
+				expect(drained.hits, `limit ${limit} budget ${budget}`).toEqual(
+					expected,
+				);
+			}
+		},
+	);
+
+	test(
+		"a docs trial bounded by the next candidate still covers every doc",
+		{ timeout: 600_000 },
+		async () => {
+			// Every candidate fails the filter-like check (its doc holds the
+			// grams apart), so postings mode tries docs mode. Candidates are
+			// adjacent in the first half (the bound is reached at once) and 1 in
+			// 30 in the second (the trial ends before it).
+			const entries = Array.from({ length: 1200 }, (_, i) => ({
+				key: `d${String(i).padStart(4, "0")}`,
+				fields: {
+					text:
+						i % 97 === 0
+							? "停車費"
+							: i < 600 || i % 30 === 0
+								? "停車 車費"
+								: "雜項",
+				},
+				sortKey: 1200 - i,
+			}));
+			const t = initConvexTest();
+			await seed(t, entries);
+			for (const [limit, budget] of [
+				[1, undefined],
+				[5, 3],
+				[50, undefined],
+			] as const) {
+				const drained = await drain(t, { query: "停車費", limit, budget });
+				expect(drained.hits, `limit ${limit} budget ${budget}`).toEqual(
+					oracle(entries, "停車費"),
+				);
+			}
+		},
+	);
+
+	test(
+		"an empty bounded continuation in a tie group does not hide older matches",
+		{ timeout: 600_000 },
+		async () => {
+			// The newest group holds the grams apart. Its docs trial opens at
+			// a candidate in that same group. Exhausting the group reaches the
+			// empty range gte(sortKey, S).lt(sortKey, S); older groups still
+			// contain matches. Include the distinct 0 and -0 index positions.
+			for (const [newest, older] of [
+				[7, 6],
+				[0, -0],
+				[-0, -1],
+			] as const) {
+				const entries = Array.from({ length: 160 }, (_, i) => ({
+					key: `${i % 2 === 0 ? "" : "\u{10000}"}${String(i).padStart(4, "0")}`,
+					fields: { text: i < 96 ? "停車 車費" : "停車費" },
+					sortKey: i < 96 ? newest : older,
+				}));
+				const t = initConvexTest();
+				await seed(t, entries);
+				const drained = await drain(t, {
+					query: "停車費",
+					limit: 50,
+					budget: 256,
+				});
+				expect(
+					drained.hits,
+					`newest ${Object.is(newest, -0) ? "-0" : newest}`,
+				).toEqual(oracle(entries, "停車費"));
+			}
 		},
 	);
 });

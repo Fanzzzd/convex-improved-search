@@ -5,15 +5,15 @@ import type {
 } from "convex/server";
 import type { ComponentApi } from "../component/_generated/component.js";
 
-import { fold } from "../component/grams.js";
+import { fold } from "../shared/grams.js";
 import {
 	CALLS_PER_TRANSACTION,
 	MAX_SCAN_BUDGET,
 	normalizeBudget as normalizeSearchBudget,
 	normalizeLimit as normalizeSearchLimit,
-} from "../component/limits.js";
+} from "../shared/limits.js";
 
-export { MAX_TEXT_LENGTH, fold } from "../component/grams.js";
+export { MAX_TEXT_LENGTH, fold } from "../shared/grams.js";
 
 /** Exact-match filter values. `null` is a real value; an absent field matches nothing. */
 export type FilterValue = string | number | boolean | null;

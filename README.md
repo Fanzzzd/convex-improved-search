@@ -334,13 +334,15 @@ continues into older shards with the same cursor contract as
   queries stream the scarcest gram (chosen by probing) and merge-join up to
   three others against it in index order. A candidate reaches its document only
   if it holds those grams and some wanted field holds all of them.
-  Single-codepoint queries use a first-codepoint index. Documents are walked by
-  a (sortKey, key) index in step with the candidates. When most documents are
-  candidates anyway, the call walks the documents alone. **Every candidate is
-  then verified per field with `folded.includes(query)`** — the index is a pure
-  candidate filter, so correctness never depends on the gram approximation (the
-  same structural argument SQLite's FTS5 trigram tokenizer relies on), and
-  `matchedFields` is the verifier's own answer.
+  Single-codepoint queries use a first-codepoint index. Longer queries walk the
+  documents by a (sortKey, key) index in step with the candidates; one-gram and
+  single-codepoint queries read each candidate's document by key, in parallel
+  rounds. When most documents are candidates anyway, the call walks the
+  documents alone. **Every candidate is then verified per field with
+  `folded.includes(query)`** — the index is a pure candidate filter, so
+  correctness never depends on the gram approximation (the same structural
+  argument SQLite's FTS5 trigram tokenizer relies on), and `matchedFields` is
+  the verifier's own answer.
 - Design lineage: SQLite FTS5 trigram tokenizer (spec), pg_bigm (gram size 2 for
   CJK), Lucene `TestNGramTokenizer` and SQLancer NoREC (differential testing
   methodology).

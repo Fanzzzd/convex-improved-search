@@ -16,7 +16,7 @@ import { appendFileSync } from "node:fs";
 import { test } from "vitest";
 import { api } from "./_generated/api.js";
 import { initConvexTest } from "./setup.test.js";
-import { firstCodepoint, fold, gramFieldsOf } from "./grams.js";
+import { firstCodepoint, fold, gramFieldsOf } from "../shared/grams.js";
 
 const NS = "bench";
 type T = ReturnType<typeof initConvexTest>;

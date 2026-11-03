@@ -47,7 +47,8 @@ over 7 pages. With both counts fixed it reads 574955 bytes over 2.
   estimate lost their evidence. Five benchmark workloads read 5.5% to 20% more
   bytes or rows than 0.5.0 (W19 `07-2607` at 10000 numbers +17% bytes), and four
   rule changes each moved the loss elsewhere. Ranges rose up to 29x (W21 36 →
-  1037).
+  1037). ADR-0013 adopts it for one-Gram and single-codepoint queries, which
+  have no checks.
 - A per-Gram document count kept on write. It would give the docs-passed
   estimate a prior, but not local density (W21 alternates 62% and 38%) or Gram
   correlation (`07-2607`), and every `set` would write the count rows of common

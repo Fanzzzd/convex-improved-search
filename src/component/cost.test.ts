@@ -10,7 +10,7 @@
 import { beforeAll, describe, expect, test } from "vitest";
 import { api } from "./_generated/api.js";
 import { initConvexTest } from "./setup.test.js";
-import { firstCodepoint, fold, gramFieldsOf } from "./grams.js";
+import { firstCodepoint, fold, gramFieldsOf } from "../shared/grams.js";
 
 const NS = "reimbursements";
 const RANGE_LIMIT = 4096;
