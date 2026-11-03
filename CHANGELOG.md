@@ -5,7 +5,6 @@
 
 ### Performance Improvements
 
-* read one-gram candidates' docs by key ([a59696a](https://github.com/Fanzzzd/convex-improved-search/commit/a59696aaaa8b26c31b375051e3c712aa912136b2))
 * read one-gram candidates' docs by key ([04120bc](https://github.com/Fanzzzd/convex-improved-search/commit/04120bc02ccba444b3c84667a07ebcfe08be6993))
 
 ## [0.5.1](https://github.com/Fanzzzd/convex-improved-search/compare/v0.5.0...v0.5.1) (2026-10-31)
