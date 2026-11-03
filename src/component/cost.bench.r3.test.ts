@@ -16,7 +16,7 @@ import { appendFileSync } from "node:fs";
 import { test } from "vitest";
 import { api } from "./_generated/api.js";
 import { initConvexTest } from "./setup.test.js";
-import * as gramsModule from "./grams.js";
+import * as gramsModule from "../shared/grams.js";
 
 const grams = gramsModule as typeof gramsModule & {
 	gramFieldsOf?: typeof gramsModule.gramFieldsOf;

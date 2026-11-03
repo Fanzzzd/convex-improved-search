@@ -15,7 +15,7 @@
 import { describe, expect, test } from "vitest";
 import { api } from "./_generated/api.js";
 import { initConvexTest } from "./setup.test.js";
-import { fold } from "./grams.js";
+import { fold } from "../shared/grams.js";
 
 const NS = "diff";
 

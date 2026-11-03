@@ -1,4 +1,6 @@
 import { ConvexError, compareValues, v } from "convex/values";
+import { rowSize } from "../shared/rowSize.js";
+import { checkedSearch } from "../shared/checkedLocalSearch.js";
 import { internalMutation, mutation, query } from "./_generated/server.js";
 import type { MutationCtx, QueryCtx } from "./_generated/server.js";
 import type { IndexRange } from "convex/server";
@@ -9,7 +11,7 @@ import {
 	CALLS_PER_TRANSACTION,
 	normalizeBudget,
 	normalizeLimit,
-} from "./limits.js";
+} from "../shared/limits.js";
 import {
 	MAX_TEXT_LENGTH,
 	gramFieldsOf,
@@ -17,7 +19,7 @@ import {
 	fold,
 	queryGrams,
 	truncateCodepoints,
-} from "./grams.js";
+} from "../shared/grams.js";
 
 /**
  * Convex counts every delete/patch as a read toward its 4096-reads-per-
@@ -36,18 +38,8 @@ const SYNC_PATCH_LIMIT = 3000;
 const REAP_BATCH = 3000;
 
 /**
- * Gram selection. A probe reads the first PROBE_ROWS postings of one query
- * gram after the cursor. The sparsest gram becomes the candidate stream and
- * the next CHECK_GRAMS sparsest are merge-joined against it. Queries with
- * more distinct grams than MAX_PROBE_GRAMS probe an evenly spaced subset.
- */
-const MAX_PROBE_GRAMS = 16;
-const PROBE_ROWS = 32;
-const CHECK_GRAMS = 3;
-
-/**
- * Rows one call may stream after probing (candidate and check streams, doc
- * reads included): ROWS_PER_CANDIDATE per budgeted candidate, between
+ * Rows one call may stream (the candidate stream, doc reads and the docs
+ * stream included): ROWS_PER_CANDIDATE per budgeted candidate, between
  * MIN_STREAM_ROWS and MAX_STREAM_ROWS. Convex allows 32000 rows read per
  * transaction.
  */
@@ -66,13 +58,10 @@ const LEAP_ROWS = 16;
  * pages of 7, 16 rows cost 4 more ranges than 0.4.0 over the drain.
  */
 const RESUME_ROWS = 64;
-/**
- * The same, for the docs stream. A reopen at the candidate reads its doc
- * first, so every walked row past the second costs more bytes than the
- * reopen saves: walks of 8, 4, 2 and 1 cost W1 168968, 144344, 132032 and
- * 125876 bytes, but 1 reads 5.7% more rows on W21 (block 160).
- */
-const DOC_LEAP_ROWS = 2;
+/** The most doc reads postings mode starts in one round. */
+const VERIFY_BATCH = 32;
+/** Convex's maximum document size: reserve it until a queued doc read resolves. */
+const DOC_READ_RESERVE = 1024 * 1024;
 const MIN_STREAM_ROWS = 64;
 const MAX_STREAM_ROWS = 4096;
 /** Transaction headroom every call leaves for the caller (hydration, its own reads). */
@@ -101,10 +90,9 @@ function readLoad(rows: number, bytes: number): number {
 	return rows * ROW_LOAD + bytes * BYTE_LOAD;
 }
 
-const utf8 = new TextEncoder();
-/** A row's size as bytesRead counts it, near enough: its JSON in UTF-8. */
+/** Fetched rows include system fields; measure their Convex encoding, not JSON text. */
 function rowBytes(row: object): number {
-	return utf8.encode(JSON.stringify(row)).length;
+	return rowSize(row);
 }
 
 const searchResultValidator = v.object({
@@ -126,26 +114,17 @@ const searchResultValidator = v.object({
 });
 
 /**
- * Position (s, k), plus `g`: the gram plan the call ended with (candidate
- * gram, then Check Grams), so the next call can skip probing, and `d: 1`
- * when it ended walking docs alone. `z: 1` marks s = -0, which JSON drops
- * but index order keeps below 0.
+ * Position (s, k), plus `d: 1` when the call ended walking docs alone.
+ * `z: 1` marks s = -0, which JSON drops but index order keeps below 0.
+ * Queries with several distinct grams page through `checkedSearch`, whose
+ * cursors also carry a gram plan (`g`); this reader never needs one.
  */
-type Cursor = { s: number; k: string; g?: string[]; d?: 1 };
+type Cursor = { s: number; k: string; d?: 1 };
 type Posting = Doc<"postings">;
 type Position = { sortKey: number; key: string };
 
 function encodeCursor(cursor: Cursor): string {
 	return JSON.stringify(Object.is(cursor.s, -0) ? { ...cursor, z: 1 } : cursor);
-}
-
-function isPlan(value: unknown): value is string[] {
-	return (
-		Array.isArray(value) &&
-		value.length >= 1 &&
-		value.length <= 1 + CHECK_GRAMS &&
-		value.every((gram) => typeof gram === "string")
-	);
 }
 
 /** A Cursor before anything was scanned: the page that returns it read nothing. */
@@ -163,12 +142,10 @@ function decodeCursor(raw: string | null | undefined): Cursor | null {
 			throw new Error("bad shape");
 		}
 		const negativeZero = (parsed as { z?: unknown }).z === 1 && parsed.s === 0;
-		const plan = isPlan(parsed.g) ? { g: parsed.g } : {};
 		const docsOnly = parsed.d === 1 ? { d: 1 as const } : {};
 		return {
 			s: negativeZero ? -0 : parsed.s,
 			k: parsed.k,
-			...plan,
 			...docsOnly,
 		};
 	} catch {
@@ -236,20 +213,51 @@ async function transactionHeadroom(
 
 /**
  * What one call may still spend: rows, index ranges and bytes, charged in
- * one place for every stream. A row is charged before it is read (so a
- * stream never reads past the cap) and its bytes after, so the bytes cap
- * can overshoot by one row.
+ * one place for every stream. A row is charged before it is read and its
+ * bytes after, so the bytes cap can overshoot by one row. Queued doc reads
+ * reserve their maximum possible bytes until they resolve, so an entire
+ * round cannot overshoot the byte cap at once.
  */
 class CallBudget {
+	private pendingBytes = 0;
+
 	constructor(
 		private rows: number,
 		private ranges: number,
 		private bytes: number,
 	) {}
+	/** Bytes not already promised to nominated docs whose reads have not resolved. */
+	get availableBytes(): number {
+		return this.bytes - this.pendingBytes;
+	}
+	get canReserveExtraDocRead(): boolean {
+		return (
+			this.rows > 0 &&
+			this.ranges > 0 &&
+			this.availableBytes >= DOC_READ_RESERVE
+		);
+	}
+	reserveDocRead() {
+		this.pendingBytes += DOC_READ_RESERVE;
+	}
+	releaseDocRead() {
+		this.pendingBytes -= DOC_READ_RESERVE;
+	}
+	releaseRanges(count: number) {
+		this.ranges += count;
+	}
+	finishDocRead(bytes: number) {
+		this.pendingBytes -= DOC_READ_RESERVE;
+		this.spendRead(bytes);
+	}
 	/** `must` spends even past zero: the first candidate of a call is always decided. */
 	takeRow(must = false): boolean {
 		this.rows -= 1;
-		return must || (this.rows >= 0 && this.bytes > 0);
+		return must || (this.rows >= 0 && this.availableBytes > 0);
+	}
+	/** Return a slot when an admitted iterator read reached EOF without a row. */
+	releaseRow() {
+		this.rows += 1;
 	}
 	takeRange(must = false): boolean {
 		this.ranges -= 1;
@@ -285,15 +293,31 @@ interface SortKeyKeyRange extends IndexRange {
 	};
 	lte(field: "sortKey", value: number): IndexRange;
 	lt(field: "sortKey", value: number): IndexRange;
+	gte(
+		field: "sortKey",
+		value: number,
+	): IndexRange & {
+		lte(field: "sortKey", value: number): IndexRange;
+		lt(field: "sortKey", value: number): IndexRange;
+	};
 }
 
-function applySeek(q: SortKeyKeyRange, seek: Seek | null): IndexRange {
-	if (seek === null) return q;
+/** `floor`: also no row below this sortKey. Tie group seeks ignore it. */
+function applySeek(
+	q: SortKeyKeyRange,
+	seek: Seek | null,
+	floor: number | null = null,
+): IndexRange {
+	if (seek === null) return floor === null ? q : q.gte("sortKey", floor);
 	switch (seek.op) {
 		case "lte":
-			return q.lte("sortKey", seek.sortKey);
+			return floor === null
+				? q.lte("sortKey", seek.sortKey)
+				: q.gte("sortKey", floor).lte("sortKey", seek.sortKey);
 		case "lt":
-			return q.lt("sortKey", seek.sortKey);
+			return floor === null
+				? q.lt("sortKey", seek.sortKey)
+				: q.gte("sortKey", floor).lt("sortKey", seek.sortKey);
 		case "tieLte":
 			return q.eq("sortKey", seek.sortKey).lte("key", seek.key);
 		case "tieLt":
@@ -322,47 +346,6 @@ function postingRange(
 	return ranged.order("desc");
 }
 
-/** At most `max` items, evenly spaced, first and last included. */
-function spread<T>(items: T[], max: number): T[] {
-	if (items.length <= max) return items;
-	return Array.from(
-		{ length: max },
-		(_, i) => items[Math.round((i * (items.length - 1)) / (max - 1))],
-	);
-}
-
-/**
- * Probe the query's grams after the cursor, sparsest first. A probe that
- * comes back short is an exact count and sparser than any full one. Of two
- * full probes, the one whose last row lies further back is spread thinner
- * over the same order. Ties keep query order. One range per gram: rows in
- * the cursor's tie group that the cursor covers still count, which can only
- * misrank a gram (cost), never drop a match.
- */
-async function probeGrams(
-	ctx: { db: QueryCtx["db"] },
-	namespace: string,
-	grams: string[],
-	cursor: Cursor | null,
-): Promise<{ gram: string; rows: number }[]> {
-	const seek: Seek | null =
-		cursor === null ? null : { op: "lte", sortKey: cursor.s };
-	const probed = await Promise.all(
-		spread(grams, MAX_PROBE_GRAMS).map(async (gram) => {
-			const rows = await postingRange(ctx, namespace, { gram }, seek).take(
-				PROBE_ROWS,
-			);
-			return { gram, rows: rows.length, last: rows.at(-1) ?? null };
-		}),
-	);
-	return probed.sort((a, b) => {
-		if (a.rows < PROBE_ROWS || b.rows < PROBE_ROWS) return a.rows - b.rows;
-		return a.last === null || b.last === null
-			? 0
-			: comparePositions(a.last, b.last);
-	});
-}
-
 /** What a stream spends through: `must` spends past zero and still succeeds. */
 type Budget = Pick<CallBudget, "takeRow" | "takeRange" | "spendRead">;
 
@@ -373,16 +356,13 @@ type SeekOptions = {
 	must?: boolean;
 	/** Rows walked before each reopen. */
 	walk?: number;
-	/** False: give up after `walk` rows instead of reopening. */
-	reopen?: boolean;
 };
 
 /**
  * Rows of one index range in DESC (sortKey, key) order, read through the
  * call's budget: one gram's (or one g1's) postings, or a namespace's docs.
- * The candidate stream, every check stream and the docs stream are
- * SortedStreams, so "skip to the cursor", "does candidate P hold this gram"
- * and "read P's doc" are the same move: `seek`.
+ * The candidate stream and docs mode's stream are SortedStreams, so "skip
+ * to the cursor" is one move for both: `seek`.
  *
  * `seek` walks the open range toward the target. After `walk` rows it
  * reopens at the target's sortKey (one range), and after `walk` more, still
@@ -391,24 +371,16 @@ type SeekOptions = {
  * open what lies below a drained tie group, however far the target is or
  * however many entries share its sortKey. An exact seek reads only the tie
  * group; once that runs dry the stream is "below sortKey" and opens the rest
- * (`lt sortKey`) only when a later seek or `next` needs it. With `reopen`
- * false the seek gives up after `walk` rows instead, leaving the head
- * before the target.
+ * (`lt sortKey`) only when a later seek or `next` needs it.
  */
 class SortedStream<Row extends Position> {
 	private rows: AsyncIterator<Row> | null = null;
 	/** Current row; null at the end. Meaningless while `below` is set. */
 	private current: Row | null = null;
 	private currentBytes = 0;
-	/** Ranges this stream has opened, and rows and bytes it has read. */
-	opened = 0;
+	/** Rows and bytes this stream has read. */
 	read = 0;
 	bytes = 0;
-	/**
-	 * Rows reopens jumped over, unread. The target lay past the walk, so each
-	 * reopen counts as one more walk: a lower bound, near enough.
-	 */
-	skipped = 0;
 	/** Set when every row at this sortKey or above is behind the stream and the rest is unopened. */
 	private below: number | null = null;
 	/** The sortKey the open range is confined to, when it is an exact (tie group) range. */
@@ -427,7 +399,7 @@ class SortedStream<Row extends Position> {
 	/** Positions the stream at its first row ≤ target (`inclusive`) or < target. False when the budget ran out. */
 	async seek(
 		target: Position | null,
-		{ inclusive, must = false, walk = LEAP_ROWS, reopen = true }: SeekOptions,
+		{ inclusive, must = false, walk = LEAP_ROWS }: SeekOptions,
 	): Promise<boolean> {
 		const beyond = (row: Position) => {
 			const order = comparePositions(row, target!);
@@ -437,7 +409,11 @@ class SortedStream<Row extends Position> {
 		if (this.rows === null) {
 			stage = "sortKey";
 			const seek: Seek | null =
-				target === null ? null : { op: "lte", sortKey: target.sortKey };
+				target === null
+					? null
+					: !inclusive
+						? { op: "tieLt", sortKey: target.sortKey, key: target.key }
+						: { op: "lte", sortKey: target.sortKey };
 			if (!(await this.reopen(seek, must))) return false;
 		}
 		if (target === null) return true;
@@ -452,8 +428,6 @@ class SortedStream<Row extends Position> {
 			}
 			if (this.current === null || !beyond(this.current)) return true;
 			if ((walked >= walk || walkedBytes >= WALK_BYTES) && stage !== "exact") {
-				if (!reopen) return true;
-				this.skipped += walk;
 				walked = 0;
 				walkedBytes = 0;
 				const inTieGroup =
@@ -494,9 +468,16 @@ class SortedStream<Row extends Position> {
 		return await this.reopen({ op: "lt", sortKey: this.below }, must);
 	}
 
+	/** Forgets the open range: the next seek reopens at its target. */
+	close() {
+		this.rows = null;
+		this.current = null;
+		this.below = null;
+		this.tieGroup = null;
+	}
+
 	private async reopen(seek: Seek | null, must: boolean): Promise<boolean> {
 		if (!this.budget.takeRange(must)) return false;
-		this.opened += 1;
 		this.rows = this.open(seek);
 		this.below = null;
 		this.tieGroup =
@@ -518,34 +499,6 @@ class SortedStream<Row extends Position> {
 	}
 }
 
-/** A Check Gram's stream and how its judgments went this call. */
-type Check = {
-	gram: string;
-	stream: SortedStream<Posting>;
-	judged: number;
-	/** Candidates it rejected by position (the gram is absent). */
-	rejected: number;
-	/** Candidates its tags rejected (the gram is in no Field holding the others). */
-	narrowed: number;
-	/** Wasted ranges to wait for after the stream fell behind, doubling each time. */
-	backoff: number;
-	/** Sit out candidates until the call has wasted this many ranges. */
-	resumeAt: number;
-	/** The next seek may reopen (it resumes after falling behind). */
-	reopenNext: boolean;
-};
-
-/** Wasted ranges a check that fell behind waits for before its first reopen. */
-const FIRST_BACKOFF = 4;
-
-/**
- * A check that has judged this many candidates without rejecting one, by
- * position or by tags, is dropped: its rows cost more than the doc reads it
- * saves.
- */
-const IDLE_CHECK_JUDGMENTS = 64;
-/** Judgments before a check's reject rate says whether the probe ranked it right. */
-const MISJUDGED_AFTER = 16;
 /** Verified candidates per judgment of whether walking docs alone is cheaper. */
 const DENSE_AFTER = 32;
 /**
@@ -554,96 +507,34 @@ const DENSE_AFTER = 32;
  * judges at least once.
  */
 const SPARSE_AFTER = 128;
-/** Docs a call's last, unfinished window needs before the call judges it. */
+/**
+ * Docs judged before docs mode, entered from postings mode, stays: postings
+ * mode reads no doc it does not verify, so it cannot see how many docs lie
+ * between its candidates, and a short trial window measures that. Also the
+ * docs a call's last, unfinished window needs before the call judges it.
+ */
 const SPARSE_AT_END = 16;
 
-/** A check that rejects most of what it judges is sparser than the candidate gram. */
-function isMisjudged(check: Check): boolean {
-	return check.judged >= MISJUDGED_AFTER && check.rejected * 2 > check.judged;
-}
-
 /**
- * Whether the candidate deserves a doc read: it holds every check gram the
- * check streams reach within their walk, and (when `retagging` is given)
- * some wanted Field holds all of them, by the postings' `fields` tags. A
- * match lies inside one Field, so every query gram's tag names it. `wanted`
- * null means any Field; an untagged posting allows any. `wasted` counts
- * the ranges the docs stream spent reaching candidates their doc then
- * rejected: the evidence a stream that fell behind waits for. Removes from
- * `checks` every stream that rejected nothing, by position or by tags, in
- * IDLE_CHECK_JUDGMENTS judgments. Null when the call budget ran out first.
- * With `mustDecide` the budget is overspent instead, so every call gets
- * past its first candidate.
+ * Whether the candidate deserves a doc read: when `retagging` is given, its
+ * posting's `fields` tag must name some wanted Field. A match lies inside
+ * one Field, so the query gram's tag names it. `wanted` null means any
+ * Field; an untagged posting allows any. Tags reject only Entries the
+ * reaper is not retagging.
  */
 async function nominate(
 	posting: Posting,
-	wasted: number,
-	checks: Check[],
 	wanted: Set<string> | null,
 	retagging: (() => Promise<Set<string> | null>) | null,
-	mustDecide: boolean,
-): Promise<boolean | null> {
-	let useTags = retagging !== null;
-	let allowed = wanted;
-	const narrow = async (row: Posting) => {
-		if (!useTags || row.fields === undefined) return true;
-		allowed = new Set(
-			allowed === null
-				? row.fields
-				: row.fields.filter((name) => allowed!.has(name)),
-		);
-		if (allowed.size > 0) return true;
-		// Tags reject only Entries the reaper is not retagging.
-		const pending = await retagging!();
-		if (pending !== null && !pending.has(posting.key)) return false;
-		useTags = false;
-		return true;
-	};
-	if (!(await narrow(posting))) return false;
-	const drop = (check: Check) => checks.splice(checks.indexOf(check), 1);
-	for (const check of [...checks]) {
-		// A check stream that cannot walk to P cannot reject it for less than
-		// the one range the doc stream spends deciding, and walking on from
-		// behind would spend rows on every later candidate too. So it sits
-		// out until the docs stream has spent `backoff` more ranges on
-		// candidates their doc rejected (doubling each time), then reopens
-		// once: a check that is dense here can still be decisive further on,
-		// and those wasted ranges say so. Rejections the docs walk reaches
-		// for free (clustered candidates) are no evidence.
-		if (wasted < check.resumeAt) continue;
-		const { stream } = check;
-		const reopen = check.reopenNext;
-		check.reopenNext = false;
-		if (
-			!(await stream.seek(posting, {
-				inclusive: true,
-				must: mustDecide,
-				reopen,
-			}))
-		)
-			return null;
-		if (stream.head !== null && comparePositions(stream.head, posting) > 0) {
-			check.resumeAt = wasted + check.backoff;
-			check.backoff *= 2;
-			check.reopenNext = true;
-			continue;
-		}
-		check.judged += 1;
-		if (stream.head === null || comparePositions(stream.head, posting) !== 0) {
-			check.rejected += 1;
-			return false;
-		}
-		if (!(await narrow(stream.head))) {
-			check.narrowed += 1;
-			return false;
-		}
-		if (
-			check.rejected + check.narrowed === 0 &&
-			check.judged >= IDLE_CHECK_JUDGMENTS
-		)
-			drop(check);
-	}
-	return true;
+): Promise<boolean> {
+	if (retagging === null || posting.fields === undefined) return true;
+	const allowed =
+		wanted === null
+			? posting.fields
+			: posting.fields.filter((name) => wanted.has(name));
+	if (allowed.length > 0) return true;
+	const pending = await retagging();
+	return pending === null || pending.has(posting.key);
 }
 
 export const search = query({
@@ -681,12 +572,17 @@ export const search = query({
 			if (codepointCount > MAX_TEXT_LENGTH) return done;
 		}
 		if (codepointCount === 0) return done;
+		const grams = codepointCount === 1 ? [] : queryGrams(folded);
+		// Several distinct grams: merge-join check grams against the sparsest
+		// and walk the docs in step (ADR-0011). One gram or one codepoint has
+		// no check to feed, so it reads each candidate's doc by key (ADR-0013).
+		if (grams.length > 1) return await checkedSearch(ctx, args);
 		const cursor = decodeCursor(args.cursor);
 		const wantedFilters = Object.entries(args.filters ?? {});
-		let headroom = await transactionHeadroom(ctx);
-		// A call always spends a probe and its first candidate, which the
-		// reserve covers. Once the caller has read into the reserve, that
-		// could overrun the transaction: hand the cursor back unspent.
+		const headroom = await transactionHeadroom(ctx);
+		// A call always spends its first candidate, which the reserve covers.
+		// Once the caller has read into the reserve, that could overrun the
+		// transaction: hand the cursor back unspent.
 		if (headroom.ranges <= 0 || headroom.rows <= 0 || headroom.bytes <= 0) {
 			return {
 				page: [],
@@ -697,76 +593,65 @@ export const search = query({
 			};
 		}
 
-		// Pick the candidate stream. Single codepoint → the g1 index (every
+		// The candidate stream. Single codepoint → the g1 index (every
 		// document character starts exactly one gram, so g1 coverage is
-		// complete). Otherwise stream the sparsest probed gram and merge-join
-		// the next sparsest against it, so most false candidates die before
-		// the doc read. Any gram's stream is a superset of the true result
-		// set, so the probe choice — even a different choice on the next
-		// page — never affects correctness, only cost.
-		let of: StreamOf;
-		let checkGrams: string[] = [];
-		const grams = codepointCount === 1 ? [] : queryGrams(folded);
-		if (codepointCount === 1) {
-			of = { g1: folded };
-		} else if (grams.length === 1) {
-			// One gram (two codepoints, or "aaa"): nothing to rank, stream it.
-			of = { gram: grams[0] };
-		} else if (cursor?.d === 1) {
-			// Docs mode needs no plan: leaving it plans from the docs it read.
-			of = { gram: grams[0] };
-		} else if (
-			cursor?.g !== undefined &&
-			cursor.g.every((gram) => grams.includes(gram))
-		) {
-			// The previous page's plan, when it judged its checks well (below).
-			of = { gram: cursor.g[0] };
-			checkGrams = cursor.g.slice(1);
-		} else {
-			const probed = await probeGrams(ctx, args.namespace, grams, cursor);
-			// Every match holds every query gram, so an empty gram ends the search.
-			if (probed[0].rows === 0) return done;
-			of = { gram: probed[0].gram };
-			checkGrams = probed.slice(1, 1 + CHECK_GRAMS).map((p) => p.gram);
-			headroom = await transactionHeadroom(ctx);
-		}
-		// Every stream of the call (candidates, checks, docs) spends from it.
+		// complete). Otherwise the one gram (two codepoints, or "aaa").
+		const of: StreamOf =
+			codepointCount === 1 ? { g1: folded } : { gram: grams[0] };
+		// What the docs mode tally counts docs holding.
+		const streamGram = codepointCount === 1 ? folded : grams[0];
+		// Every stream of the call (candidates, doc reads, docs) spends from
+		// it. Per candidate: a range for the candidate stream and one for its
+		// own doc read.
 		const callBudget = new CallBudget(
 			Math.max(
 				MIN_STREAM_ROWS,
 				Math.min(budget * ROWS_PER_CANDIDATE, MAX_STREAM_ROWS, headroom.rows),
 			),
-			Math.min(
-				budget * (1 + Math.min(CHECK_GRAMS, Math.max(0, grams.length - 1))),
-				headroom.ranges - 1,
-			),
+			Math.min(budget * 2, headroom.ranges - 1),
 			headroom.bytes,
 		);
-		const streamOf = (stream: StreamOf) =>
-			new SortedStream<Posting>(
-				(seek) =>
-					postingRange(ctx, args.namespace, stream, seek)[
-						Symbol.asyncIterator
-					](),
-				callBudget,
-			);
-		let candidates = streamOf(of);
-		const checkOf = (gram: string, stream: SortedStream<Posting>): Check => ({
-			gram,
-			stream,
-			judged: 0,
-			rejected: 0,
-			narrowed: 0,
-			backoff: FIRST_BACKOFF,
-			resumeAt: 0,
-			reopenNext: false,
-		});
-		const checks = checkGrams.map((gram) => checkOf(gram, streamOf({ gram })));
+		const candidates = new SortedStream<Posting>(
+			(seek) =>
+				postingRange(ctx, args.namespace, of, seek)[Symbol.asyncIterator](),
+			callBudget,
+		);
+		// Postings mode reads each nominated candidate's own doc: one range
+		// and one row, and no doc it does not verify. Null when no live doc
+		// sits at the posting's (sortKey, key): the Entry is gone, or the
+		// posting is stale (its reap is pending) and the live posting at
+		// doc.sortKey nominates the Entry instead. The caller has taken the
+		// range and row from the call budget.
+		const pointRead = { rows: 0, bytes: 0 };
+		const chargeDoc = (doc: Doc<"docs"> | null) => {
+			const bytes = doc === null ? 0 : rowBytes(doc);
+			callBudget.finishDocRead(bytes);
+			pointRead.rows += 1;
+			pointRead.bytes += bytes;
+		};
+		const readDoc = async (posting: Posting): Promise<Doc<"docs"> | null> => {
+			const doc = await ctx.db
+				.query("docs")
+				.withIndex("by_ns_key", (q) =>
+					q.eq("namespace", args.namespace).eq("key", posting.key),
+				)
+				.first();
+			chargeDoc(doc);
+			return doc !== null && comparePositions(doc, posting) === 0 ? doc : null;
+		};
+		// Docs mode walks every Entry in index order. Rows from a range open
+		// to the namespace's end come back several times slower than from one
+		// bounded below, at the same rows and bytes. So a trial window entered
+		// from postings mode stops at the next candidate's sortKey (`docsFloor`),
+		// which postings mode reads next anyway: the docs it passes there are
+		// the ones postings mode would jump over. Reaching the floor before the
+		// window fills drops it, and the walk reopens open-ended.
+		let docsFloor: number | null = null;
 		const docs = new SortedStream<Doc<"docs">>((seek) => {
 			const range = ctx.db
 				.query("docs")
 				.withIndex("by_ns_sort", (q) =>
-					applySeek(q.eq("namespace", args.namespace), seek),
+					applySeek(q.eq("namespace", args.namespace), seek, docsFloor),
 				)
 				.order("desc");
 			return range[Symbol.asyncIterator]();
@@ -777,76 +662,84 @@ export const search = query({
 		const retagging = async () =>
 			await (pendingRetags ??= (async () => {
 				callBudget.takeRange(true);
-				const rows = await ctx.db
+				const range = ctx.db
 					.query("retagging")
-					.withIndex("by_ns_key", (q) => q.eq("namespace", args.namespace))
-					.take(MAX_RETAGGING + 1);
-				return rows.length > MAX_RETAGGING
-					? null
-					: new Set(rows.map((row) => row.key));
+					.withIndex("by_ns_key", (q) => q.eq("namespace", args.namespace));
+				const rows = range[Symbol.asyncIterator]();
+				const pending = new Set<string>();
+				try {
+					for (let seen = 0; seen <= MAX_RETAGGING; seen++) {
+						// An incomplete list cannot justify rejecting any tag.
+						if (!callBudget.takeRow()) return null;
+						const next = await rows.next();
+						if (next.done) {
+							callBudget.releaseRow();
+							return pending;
+						}
+						callBudget.spendRead(rowBytes(next.value));
+						pending.add(next.value.key);
+					}
+					return null;
+				} finally {
+					await rows.return?.();
+				}
 			})());
 
 		const page: { key: string; sortKey: number; matchedFields: string[] }[] =
 			[];
 		let verified = 0;
 		let examined = 0;
-		/** Ranges the docs stream spent reaching candidates their doc then rejected. */
-		let wasted = 0;
 		let last: Cursor | null = null;
 		let exhausted = true;
-		// Two modes. Postings: stream candidates, merge-join checks, verify the
-		// survivors against docs walked in step. Docs: when that reads less,
-		// walk the docs alone and verify each one. The docs stream holds
-		// every Entry, so docs mode is the oracle itself; only the cost differs.
+		// Two modes. Postings: stream candidates and read the nominated ones'
+		// own docs. Docs: when that reads more, walk the docs alone and verify
+		// each one. The docs stream holds every Entry, so docs mode is the
+		// oracle itself; only the cost differs.
 		let docsOnly = cursor?.d === 1;
 		let more = true;
-		// Docs mode reads each Entry's text, so it measures what a probe
-		// guesses: how many docs hold each gram (in a wanted Field).
-		const sampled =
-			codepointCount === 1 ? [folded] : spread(grams, MAX_PROBE_GRAMS);
 		// Each mode is judged by the rows and bytes it reads per doc passed,
 		// in load units; the cheaper one runs. Docs mode reads one doc row.
-		const docLoad = () =>
-			readLoad(1, docs.read > 0 ? docs.bytes / docs.read : 0);
-		// Docs that postings mode walked or jumped over: at least what the
-		// docs stream read or skipped, and at least one per candidate.
-		const docsPassed = () => Math.max(docs.read + docs.skipped, examined);
+		const docLoad = () => {
+			const rows = docs.read + pointRead.rows;
+			return readLoad(1, rows > 0 ? (docs.bytes + pointRead.bytes) / rows : 0);
+		};
+		// Docs passed: one per doc in docs mode. Postings mode reads no doc it
+		// does not verify, so it counts `perCandidate` per candidate: one, a
+		// lower bound, until a docs window has measured how many docs each
+		// candidate of its plan stands for.
+		let passed = 0;
+		let perCandidate = 1;
 		const mark = () => ({
 			verified,
-			docs: docsPassed(),
+			docs: passed,
 			load: readLoad(callBudget.rowsRead, callBudget.bytesRead),
 		});
 		let since = mark();
-		// Per window of docs in docs mode: how many hold each sampled gram in
-		// any Field (a gram's stream holds them all), how many hold all of
-		// them in one Field (`dense`), a wanted one once the call has read a
-		// tagged posting (tags reject the rest), and the rows postings mode's
-		// docs walk would read to reach those (`walk`: from each, at most
-		// DOC_LEAP_ROWS to the next; `gap` docs since the last).
+		// Per window of docs in docs mode: how many hold the stream's gram in
+		// any Field (its stream holds them all), and how many hold it in a
+		// wanted Field (`dense`) once the call has read a tagged posting (tags
+		// reject the rest; before that, in any Field).
 		let tagged = false;
 		const span = Math.min(SPARSE_AFTER, Math.ceil(budget / 2));
+		let window = span;
 		const tally = {
 			seen: 0,
 			dense: 0,
-			walk: 0,
-			gap: 0,
-			held: sampled.map(() => 0),
+			held: 0,
 			last: null as Doc<"docs"> | null,
 		};
 		const restartTally = () => {
-			Object.assign(tally, { seen: 0, dense: 0, walk: 0, gap: 0 });
-			tally.held.fill(0);
+			Object.assign(tally, { seen: 0, dense: 0, held: 0 });
 		};
-		const ranked = () =>
-			sampled
-				.map((gram, i) => ({ gram, held: tally.held[i] }))
-				.sort((a, b) => a.held - b.held);
 		// A posting's load from the postings the call read, or, before it
 		// read any, from the posting row the last doc would have.
 		const postingLoad = () => {
-			const rows = callBudget.rowsRead - docs.read;
+			const rows = callBudget.rowsRead - docs.read - pointRead.rows;
 			if (rows > 0)
-				return readLoad(1, (callBudget.bytesRead - docs.bytes) / rows);
+				return readLoad(
+					1,
+					(callBudget.bytesRead - docs.bytes - pointRead.bytes) / rows,
+				);
 			const doc = tally.last!;
 			return readLoad(
 				1,
@@ -855,54 +748,25 @@ export const search = query({
 					_creationTime: doc._creationTime,
 					namespace: doc.namespace,
 					key: doc.key,
-					gram: sampled[0],
-					g1: firstCodepoint(sampled[0]),
+					gram: streamGram,
+					g1: firstCodepoint(streamGram),
 					sortKey: doc.sortKey,
 					fields: Object.keys(doc.fields),
 				}),
 			);
 		};
-		// What postings mode would read over the window: the sparsest gram's
-		// postings, each check's walk to the next candidate (at most LEAP_ROWS
-		// rows per candidate), and the docs walk to the docs the plan verifies,
-		// at least the dense ones.
-		const postingsCheaper = () => {
-			const [first, ...rest] = ranked();
-			const postingRows =
-				first.held +
-				rest
-					.slice(0, CHECK_GRAMS)
-					.reduce(
-						(sum, { held }) => sum + Math.min(held, LEAP_ROWS * first.held),
-						0,
-					);
-			return (
-				postingRows * postingLoad() + tally.walk * docLoad() <
-				tally.seen * docLoad()
-			);
-		};
-		// Back to postings with a plan from the window: the sparsest gram
-		// streams, the next ones check. A gram already streamed keeps its
-		// stream (its next seek walks or reopens); none holds an unhandled row
-		// above its head, as for a swap.
+		// What postings mode would read over the window: the gram's postings,
+		// and a doc read for each doc it verifies, at least the dense ones.
+		const postingsCheaper = () =>
+			tally.held + tally.dense <= tally.seen &&
+			tally.held * postingLoad() + tally.dense * docLoad() <
+				tally.seen * docLoad();
+		// Back to postings. The candidate stream holds no unhandled row above
+		// its head: its next seek walks or reopens to the docs walk's position.
 		const leaveDocs = () => {
 			docsOnly = false;
-			if ("gram" in of) {
-				const open = new Map(checks.map((check) => [check.gram, check.stream]));
-				open.set(of.gram, candidates);
-				const streamFor = (gram: string) =>
-					open.get(gram) ?? streamOf({ gram });
-				const [first, ...rest] = ranked();
-				of = { gram: first.gram };
-				candidates = streamFor(of.gram);
-				checks.splice(
-					0,
-					checks.length,
-					...rest
-						.slice(0, CHECK_GRAMS)
-						.map(({ gram }) => checkOf(gram, streamFor(gram))),
-				);
-			}
+			docsFloor = null;
+			perCandidate = tally.seen / Math.max(1, tally.held);
 			since = mark();
 		};
 		const resumeAt = (): Position | null =>
@@ -911,8 +775,130 @@ export const search = query({
 				: cursor === null
 					? null
 					: { sortKey: cursor.s, key: cursor.k };
+		// Postings mode queues candidates in stream order and reads the
+		// nominated ones' docs together, up to the page's free slots and the
+		// budget left, so a page of matches waits on a few rounds of reads
+		// instead of one per match. No nomination depends on an earlier doc
+		// read. Short pages start with full rounds; long pages first read one
+		// doc so they can test adjacency before committing to point reads.
+		// A nomination takes its range and row from the call budget
+		// at once, and reserves the maximum doc size while queued. Before the
+		// next maximum-sized doc would spend the byte reserve, the queue is
+		// handled and its actual bytes charged. `last` moves past a candidate
+		// only when the queue is handled.
+		const queue: { posting: Posting; nominated: boolean }[] = [];
+		let reading = 0;
+		// Short pages finish before an adjacency trial can be amortized.
+		let batch = limit <= DENSE_AFTER ? VERIFY_BATCH : 1;
+		let triedAdjacency = false;
+		let coalesceTies = true;
+		const readQueued = async (
+			entries: typeof queue,
+		): Promise<(Doc<"docs"> | null)[]> => {
+			const points = () =>
+				Promise.all(
+					entries.map((entry) =>
+						entry.nominated ? readDoc(entry.posting) : null,
+					),
+				);
+			if (
+				!coalesceTies ||
+				entries.length < 2 ||
+				entries.some((entry) => !entry.nominated) ||
+				!callBudget.canReserveExtraDocRead
+			)
+				return await points();
+			const first = entries[0].posting,
+				tail = entries[entries.length - 1].posting;
+			if (
+				entries.some(
+					(entry) => compareValues(entry.posting.sortKey, first.sortKey) !== 0,
+				)
+			)
+				return await points();
+			// N nominations already hold N row/range/maximum-doc reservations.
+			// One extra reservation bounds a failed prefix look; unmatched
+			// nominations retain their original point-read reservations.
+			callBudget.takeRange();
+			callBudget.takeRow();
+			callBudget.reserveDocRead();
+			const range = ctx.db
+				.query("docs")
+				.withIndex("by_ns_sort", (q) =>
+					q
+						.eq("namespace", args.namespace)
+						.eq("sortKey", first.sortKey)
+						.gte("key", tail.key)
+						.lte("key", first.key),
+				)
+				.order("desc");
+			const rows = range[Symbol.asyncIterator]();
+			const resolved: (Doc<"docs"> | null)[] = [];
+			let usedExtra = false;
+			try {
+				while (resolved.length < entries.length) {
+					const next = await rows.next();
+					if (next.done) break;
+					chargeDoc(next.value);
+					if (
+						comparePositions(next.value, entries[resolved.length].posting) !== 0
+					) {
+						usedExtra = true;
+						coalesceTies = false;
+						break;
+					}
+					resolved.push(next.value);
+				}
+			} finally {
+				await rows.return?.();
+			}
+			// Only point ranges that never executed are refunded. Every fetched
+			// row, including a failed look, was charged at its exact size.
+			callBudget.releaseRanges(resolved.length);
+			if (!usedExtra) {
+				callBudget.releaseDocRead();
+				callBudget.releaseRow();
+			}
+			if (resolved.length < entries.length) coalesceTies = false;
+			const remaining = await Promise.all(
+				entries.slice(resolved.length).map((entry) => readDoc(entry.posting)),
+			);
+			return resolved.concat(remaining);
+		};
+		/** Handles the queue in order. False once the page or budget fills; the rest is left unhandled. */
+		const flush = async (): Promise<boolean> => {
+			const entries = queue.splice(0);
+			if (reading > 0) batch = VERIFY_BATCH;
+			reading = 0;
+			const read = await readQueued(entries);
+			for (let i = 0; i < entries.length; i++) {
+				const { posting } = entries[i];
+				last = cursorAt(posting);
+				examined += 1;
+				passed += perCandidate;
+				if (!entries[i].nominated) continue;
+				verified += 1;
+				const doc = read[i];
+				const matchedFields = verifyCandidate(
+					doc,
+					wantedFilters,
+					folded,
+					fieldNames,
+				);
+				if (matchedFields !== null)
+					page.push({
+						key: posting.key,
+						sortKey: posting.sortKey,
+						matchedFields,
+					});
+				if (page.length >= limit || verified >= budget) return false;
+			}
+			return true;
+		};
 		modes: for (;;) {
 			if (docsOnly) {
+				// Back in postings mode, the first round reads one doc again.
+				batch = 1;
 				more =
 					(await docs.seek(resumeAt(), {
 						inclusive: false,
@@ -922,21 +908,27 @@ export const search = query({
 				restartTally();
 				while (more) {
 					const doc = docs.head;
+					if (doc === null && docsFloor !== null) {
+						// The floor, not the end of the docs: walk on open-ended.
+						docsFloor = null;
+						docs.close();
+						more =
+							(await docs.seek(resumeAt(), {
+								inclusive: false,
+								walk: RESUME_ROWS,
+							})) && (await docs.land(false));
+						continue;
+					}
 					if (doc === null) break;
 					last = cursorAt(doc);
 					examined += 1;
 					verified += 1;
+					passed += 1;
 					tally.seen += 1;
 					tally.last = doc;
-					sampled.forEach((gram, i) => {
-						if (holds(doc, [gram], null)) tally.held[i] += 1;
-					});
-					tally.gap += 1;
-					if (holds(doc, sampled, tagged ? fieldNames : null)) {
+					if (holds(doc, [streamGram], null)) tally.held += 1;
+					if (holds(doc, [streamGram], tagged ? fieldNames : null))
 						tally.dense += 1;
-						tally.walk += Math.min(tally.gap, DOC_LEAP_ROWS);
-						tally.gap = 0;
-					}
 					const matchedFields = verifyCandidate(
 						doc,
 						wantedFilters,
@@ -949,12 +941,13 @@ export const search = query({
 						exhausted = false;
 						break modes;
 					}
-					if (tally.seen >= span) {
+					if (tally.seen >= window) {
 						if (postingsCheaper()) {
 							leaveDocs();
 							continue modes;
 						}
 						restartTally();
+						window = span;
 					}
 					more = await docs.next();
 				}
@@ -979,116 +972,118 @@ export const search = query({
 				// One document can own several adjacent rows at one position in
 				// this stream (all its g1 grams; briefly, duplicates while a reap
 				// is pending).
+				const prev = queue.length > 0 ? queue[queue.length - 1].posting : null;
 				if (
-					last !== null &&
-					comparePositions(posting, { sortKey: last.s, key: last.k }) === 0
+					prev !== null
+						? comparePositions(posting, prev) === 0
+						: last !== null &&
+							comparePositions(posting, { sortKey: last.s, key: last.k }) === 0
 				) {
 					more = await candidates.next();
 					continue;
 				}
 				if ("gram" in of && posting.fields !== undefined) tagged = true;
 				// g1 rows tag one gram each, not the query codepoint, so tags apply only to gram streams.
+				const first = last === null && queue.length === 0;
 				const nominated = await nominate(
 					posting,
-					wasted,
-					checks,
 					fieldNames,
 					"gram" in of ? retagging : null,
-					last === null,
 				);
-				const docRanges = docs.opened;
+				// A bounded look immediately after the last
+				// handled candidate can establish adjacency. Dense plans need not
+				// spend 32 separate point lookups to discover a docs walk is cheap.
+				// At most once per call, and only when a full normal judgment
+				// window remains. Short pages keep direct reads instead of paying
+				// startup cost for a trial they would not normally reach. A field
+				// scope on a tagged gram stream can prune postings before doc reads;
+				// adjacency alone does not prove the docs walk is cheaper then.
 				if (
-					nominated === null ||
-					(nominated &&
-						!(await docs.seek(posting, {
-							inclusive: true,
-							must: last === null,
-							walk: DOC_LEAP_ROWS,
-						})))
+					nominated &&
+					!triedAdjacency &&
+					queue.length === 0 &&
+					!(
+						fieldNames !== null &&
+						"gram" in of &&
+						posting.fields !== undefined
+					) &&
+					last !== null &&
+					verified > 0 &&
+					verified === examined &&
+					limit - page.length >= DENSE_AFTER &&
+					budget - verified >= DENSE_AFTER
 				) {
-					last = cursorBefore(posting);
+					triedAdjacency = true;
+					docsFloor = posting.sortKey;
+					docs.close();
+					const landed =
+						(await docs.seek(resumeAt(), { inclusive: false })) &&
+						(await docs.land(false));
+					if (
+						landed &&
+						docs.head !== null &&
+						comparePositions(docs.head, posting) === 0
+					) {
+						docsOnly = true;
+						window = Math.min(span, SPARSE_AT_END);
+						continue modes;
+					}
+					docsFloor = null;
+					docs.close();
+				}
+				if (
+					nominated &&
+					!(callBudget.takeRange(first) && callBudget.takeRow(first))
+				) {
+					if (await flush()) last = cursorBefore(posting);
 					exhausted = false;
 					break modes;
 				}
-				last = cursorAt(posting);
-				examined += 1;
+				queue.push({ posting, nominated });
 				if (nominated) {
-					verified += 1;
-					const doc =
-						docs.head !== null && comparePositions(docs.head, posting) === 0
-							? docs.head
-							: null;
-					const matchedFields = verifyCandidate(
-						doc,
-						wantedFilters,
-						folded,
-						fieldNames,
-					);
-					if (matchedFields !== null) {
-						page.push({
-							key: posting.key,
-							sortKey: posting.sortKey,
-							matchedFields,
-						});
-					} else {
-						wasted += docs.opened - docRanges;
-					}
-					if (page.length >= limit || verified >= budget) {
-						exhausted = false;
-						break modes;
-					}
+					callBudget.reserveDocRead();
+					reading += 1;
 				}
-				// A check that rejects most of what it judges is sparser than the
-				// candidate gram here: the probe ranked them wrong (or the corpus
-				// changed along the order). It becomes the candidate stream, and the
-				// old one a check. Safe once the check has been walked to this
-				// candidate: every match holds both grams, and the check stream
-				// holds no unhandled row above its head.
-				const sparser = checks.find(
-					(check) =>
-						isMisjudged(check) &&
-						(check.stream.head === null ||
-							comparePositions(check.stream.head, posting) <= 0),
-				);
-				if (sparser !== undefined && "gram" in of) {
-					checks.splice(
-						checks.indexOf(sparser),
-						1,
-						checkOf(of.gram, candidates),
-					);
-					for (const check of checks)
-						Object.assign(check, { judged: 0, rejected: 0, narrowed: 0 });
-					of = { gram: sparser.gram };
-					candidates = sparser.stream;
-					more = await candidates.land(false);
-					continue;
+				if (
+					(reading === 0 ||
+						callBudget.availableBytes < DOC_READ_RESERVE ||
+						reading >=
+							Math.min(batch, limit - page.length, budget - verified)) &&
+					!(await flush())
+				) {
+					exhausted = false;
+					break modes;
 				}
 				// When the rows and bytes read since the last judgment come to as
 				// much per doc passed as reading those docs alone would, walk the
-				// docs alone from here and verify each one. Ranges stay out: a
-				// reopen jumps docs the count cannot see. Judged per DENSE_AFTER
-				// verifications or `span` docs passed, so a dense stretch counts
-				// only while it lasts, and only once every check has shown what
-				// it does: it rejected some candidate, or judged enough to be
-				// kept or dropped on evidence.
+				// docs alone from here and verify each one. Ranges stay out, as
+				// in docs mode. Judged per DENSE_AFTER verifications or `span`
+				// docs passed, so a dense stretch counts only while it lasts.
 				if (
-					checks.every(
-						(check) =>
-							check.rejected + check.narrowed > 0 ||
-							check.judged >= MISJUDGED_AFTER,
-					) &&
-					(verified - since.verified >= DENSE_AFTER ||
-						docsPassed() - since.docs >= span)
+					verified + reading - since.verified >= DENSE_AFTER ||
+					passed + queue.length * perCandidate - since.docs >= span
 				) {
+					if (!(await flush())) {
+						exhausted = false;
+						break modes;
+					}
 					const now = mark();
 					if (now.load - since.load >= (now.docs - since.docs) * docLoad()) {
+						// The trial window stops at the next candidate. None left
+						// means no match is left either.
+						more = await candidates.next();
+						if (!more || candidates.head === null) break modes;
 						docsOnly = true;
+						window = Math.min(span, SPARSE_AT_END);
+						docsFloor = candidates.head.sortKey;
+						docs.close();
 						continue modes;
 					}
 					since = now;
 				}
 				more = await candidates.next();
 			}
+			if (!(await flush())) exhausted = false;
 			break modes;
 		}
 		if (!more) exhausted = false;
@@ -1102,19 +1097,12 @@ export const search = query({
 		)
 			leaveDocs();
 
-		// Carry the plan forward, minus dropped checks, unless a check still
-		// rejects most of what it judges (the next page probes again). A call
-		// that ended in docs mode tells the next one to start there, and
-		// needs no plan.
-		const plan = docsOnly
-			? { d: 1 as const }
-			: "gram" in of && grams.length > 1 && !checks.some(isMisjudged)
-				? { g: [of.gram, ...checks.map((check) => check.gram)] }
-				: {};
+		// A call that ended in docs mode tells the next one to start there.
+		const mode = docsOnly ? { d: 1 as const } : {};
 		return {
 			page,
 			cursor:
-				exhausted || last === null ? null : encodeCursor({ ...last, ...plan }),
+				exhausted || last === null ? null : encodeCursor({ ...last, ...mode }),
 			isDone: exhausted,
 			scanned: examined,
 			verified,

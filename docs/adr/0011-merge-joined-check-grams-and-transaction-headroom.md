@@ -104,6 +104,9 @@ union over an Entry's rows would describe the codepoint.
 
 ## Docs in step
 
+Since ADR-0013 this applies to queries with several distinct Grams; one-Gram and
+single-codepoint queries read each candidate's doc by key.
+
 A nominated candidate is verified against the docs row at its own (sortKey,
 key), found by seeking the docs stream. Dense candidates cost a few streamed
 rows each instead of one range each; a far candidate costs one range, as the
