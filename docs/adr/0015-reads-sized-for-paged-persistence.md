@@ -115,8 +115,8 @@ result, not the milliseconds). The ADR-0014 column is from 9 rounds:
 On 300 docs of 4 KB: `zq7` (a hit every 13th doc) 1.28, 30 against 24 ms, and
 `abc` (nearly every doc) 1.07. Each call of `zq7` walks two far docs before the
 docs stream knows their spacing and reads by key. Carrying that spacing in the
-Cursor cut its bytes 6% and no time, and 0.3% of the bytes over the 49
-benchmark workloads below: not worth a Cursor field.
+Cursor cut its bytes 6% and no time, and 0.3% of the bytes over the 49 benchmark
+workloads below: not worth a Cursor field.
 
 Rows Postgres returned for the first two: 1450 and 2715, against 3981 and 7742
 before, and 872 and 2916 for patched 0.4.0. `ROUTE-ONLY` pages after its idle
