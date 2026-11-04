@@ -56,6 +56,20 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         null,
         Name
       >;
+      retagKey: FunctionReference<
+        "mutation",
+        "internal",
+        { key: string; namespace: string },
+        boolean,
+        Name
+      >;
+      retagNamespace: FunctionReference<
+        "mutation",
+        "internal",
+        { cursor?: string | null; namespace: string },
+        { cursor: string | null; retagged: number },
+        Name
+      >;
       search: FunctionReference<
         "query",
         "internal",

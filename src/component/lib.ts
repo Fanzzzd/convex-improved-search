@@ -1237,96 +1237,116 @@ export const set = mutation({
 		} else {
 			await ctx.db.insert("docs", docRow);
 		}
-
-		// Gram diff: text edits touch few grams, so re-setting a document is
-		// nearly free; only a full text replacement pays the full fan-out.
-		// Grams never span fields: each field gets its own window + sentinel.
-		const newGrams = gramFieldsOf(foldedFields);
-		const oldPostings = await ctx.db
-			.query("postings")
-			.withIndex("by_ns_key", (q) =>
-				q.eq("namespace", args.namespace).eq("key", args.key),
-			)
-			.collect();
-		const oldByGram = new Map(oldPostings.map((p) => [p.gram, p]));
-		const toPatch: typeof oldPostings = [];
-		const toDelete: typeof oldPostings = [];
-		for (const [gram, postingRow] of oldByGram) {
-			if (!newGrams.has(gram)) toDelete.push(postingRow);
-		}
-		// Every row of a kept gram, duplicates included: a duplicate at the
-		// current sortKey with a stale tag would drop a true match.
-		for (const postingRow of oldPostings) {
-			const tag = newGrams.get(postingRow.gram);
-			if (
-				tag !== undefined &&
-				(!Object.is(postingRow.sortKey, args.sortKey) ||
-					!sameTag(postingRow.fields, tag))
-			) {
-				toPatch.push(postingRow);
-			}
-		}
-		// SortKey patches must land inline (a stale sortKey breaks page order).
-		// Tag-only patches past the limit (a Field rename over a large text)
-		// go to the reaper, and the `retagging` row makes search ignore this
-		// Entry's tags until it is done.
-		const sortKeyPatches = toPatch.filter(
-			(p) => !Object.is(p.sortKey, args.sortKey),
-		);
-		if (sortKeyPatches.length > SYNC_PATCH_LIMIT) {
-			throw new ConvexError(
-				`Changing the sortKey of "${args.key}" would rewrite ${sortKeyPatches.length} ` +
-					`postings in one transaction (limit ${SYNC_PATCH_LIMIT}). Use a ` +
-					`stable sortKey for very large texts, or remove() and re-set() ` +
-					`after its reap completes.`,
-			);
-		}
-		const retag = toPatch.length > SYNC_PATCH_LIMIT;
-		const patchNow = retag ? sortKeyPatches : toPatch;
-		if (retag) await markRetagging(ctx, args.namespace, args.key);
-		for (const postingRow of patchNow) {
-			await ctx.db.patch("postings", postingRow._id, {
-				sortKey: args.sortKey,
-				fields: newGrams.get(postingRow.gram),
-			});
-		}
-		// Deletes are deferrable (stale postings are only false candidates), so
-		// spend a small inline budget and hand the rest to the reaper. A dup
-		// row (same gram twice, from an earlier deferred remove) also needs it.
-		let deleteBudget = Math.min(
-			SYNC_DELETE_BUDGET,
-			SYNC_PATCH_LIMIT - patchNow.length,
-		);
-		let deferred = retag || oldPostings.length !== oldByGram.size;
-		for (const postingRow of toDelete) {
-			if (deleteBudget <= 0) {
-				deferred = true;
-				break;
-			}
-			await ctx.db.delete("postings", postingRow._id);
-			deleteBudget -= 1;
-		}
-		for (const [gram, tag] of newGrams) {
-			if (!oldByGram.has(gram)) {
-				await ctx.db.insert("postings", {
-					namespace: args.namespace,
-					key: args.key,
-					gram,
-					g1: firstCodepoint(gram),
-					sortKey: args.sortKey,
-					fields: tag,
-				});
-			}
-		}
-		if (deferred) {
-			await ctx.scheduler.runAfter(0, internal.lib.reapKey, {
-				namespace: args.namespace,
-				key: args.key,
-			});
-		}
+		await writePostings(ctx, docRow);
 		return null;
 	},
 });
+
+/**
+ * Bring one Entry's postings in line with its folded fields and sortKey.
+ * Returns the posting rows it read and wrote, for callers that bound a batch.
+ */
+async function writePostings(
+	ctx: MutationCtx,
+	args: {
+		namespace: string;
+		key: string;
+		fields: Record<string, string>;
+		sortKey: number;
+	},
+): Promise<{ read: number; written: number }> {
+	// Gram diff: text edits touch few grams, so re-setting a document is
+	// nearly free; only a full text replacement pays the full fan-out.
+	// Grams never span fields: each field gets its own window + sentinel.
+	const newGrams = gramFieldsOf(args.fields);
+	const oldPostings = await ctx.db
+		.query("postings")
+		.withIndex("by_ns_key", (q) =>
+			q.eq("namespace", args.namespace).eq("key", args.key),
+		)
+		.collect();
+	let writes = 0;
+	const oldByGram = new Map(oldPostings.map((p) => [p.gram, p]));
+	const toPatch: typeof oldPostings = [];
+	const toDelete: typeof oldPostings = [];
+	for (const [gram, postingRow] of oldByGram) {
+		if (!newGrams.has(gram)) toDelete.push(postingRow);
+	}
+	// Every row of a kept gram, duplicates included: a duplicate at the
+	// current sortKey with a stale tag would drop a true match.
+	for (const postingRow of oldPostings) {
+		const tag = newGrams.get(postingRow.gram);
+		if (
+			tag !== undefined &&
+			(!Object.is(postingRow.sortKey, args.sortKey) ||
+				!sameTag(postingRow.fields, tag))
+		) {
+			toPatch.push(postingRow);
+		}
+	}
+	// SortKey patches must land inline (a stale sortKey breaks page order).
+	// Tag-only patches past the limit (a Field rename over a large text)
+	// go to the reaper, and the `retagging` row makes search ignore this
+	// Entry's tags until it is done.
+	const sortKeyPatches = toPatch.filter(
+		(p) => !Object.is(p.sortKey, args.sortKey),
+	);
+	if (sortKeyPatches.length > SYNC_PATCH_LIMIT) {
+		throw new ConvexError(
+			`Changing the sortKey of "${args.key}" would rewrite ${sortKeyPatches.length} ` +
+				`postings in one transaction (limit ${SYNC_PATCH_LIMIT}). Use a ` +
+				`stable sortKey for very large texts, or remove() and re-set() ` +
+				`after its reap completes.`,
+		);
+	}
+	const retag = toPatch.length > SYNC_PATCH_LIMIT;
+	const patchNow = retag ? sortKeyPatches : toPatch;
+	if (retag) await markRetagging(ctx, args.namespace, args.key);
+	for (const postingRow of patchNow) {
+		await ctx.db.patch("postings", postingRow._id, {
+			sortKey: args.sortKey,
+			fields: newGrams.get(postingRow.gram),
+		});
+		writes += 1;
+	}
+	// Deletes are deferrable (stale postings are only false candidates), so
+	// spend a small inline budget and hand the rest to the reaper. A dup
+	// row (same gram twice, from an earlier deferred remove) also needs it.
+	let deleteBudget = Math.min(
+		SYNC_DELETE_BUDGET,
+		SYNC_PATCH_LIMIT - patchNow.length,
+	);
+	let deferred = retag || oldPostings.length !== oldByGram.size;
+	for (const postingRow of toDelete) {
+		if (deleteBudget <= 0) {
+			deferred = true;
+			break;
+		}
+		await ctx.db.delete("postings", postingRow._id);
+		deleteBudget -= 1;
+		writes += 1;
+	}
+	for (const [gram, tag] of newGrams) {
+		if (!oldByGram.has(gram)) {
+			await ctx.db.insert("postings", {
+				namespace: args.namespace,
+				key: args.key,
+				gram,
+				g1: firstCodepoint(gram),
+				sortKey: args.sortKey,
+				fields: tag,
+			});
+			writes += 1;
+		}
+	}
+	if (deferred) {
+		await ctx.scheduler.runAfter(0, internal.lib.reapKey, {
+			namespace: args.namespace,
+			key: args.key,
+		});
+	}
+	return { read: oldPostings.length, written: writes };
+}
 
 function sameFields(
 	a: Record<string, string>,
@@ -1481,6 +1501,105 @@ export const reapKey = internalMutation({
 			.collect();
 		for (const mark of marks) await ctx.db.delete("retagging", mark._id);
 		return null;
+	},
+});
+
+/**
+ * What retagging one more Entry may read and write: its doc, one posting
+ * per gram (up to MAX_TEXT_LENGTH plus a sentinel per Field, at most 1024
+ * Fields) and their rewrite, with room for a large doc and long tags.
+ */
+const RETAG_ENTRY_ROWS = MAX_TEXT_LENGTH + 1024 + 2;
+const RETAG_ENTRY_RANGES = 2;
+const RETAG_ENTRY_BYTES = 4 * 1024 * 1024;
+const RETAG_ENTRY_WRITES = MAX_TEXT_LENGTH + 1024 + SYNC_DELETE_BUDGET;
+
+/**
+ * Whether the transaction has room for one more Entry after the caller's
+ * reserve. Without getTransactionMetrics (older backends) a call cannot see
+ * what a retag cost, so it retags one Entry.
+ */
+async function roomForAnotherRetag(ctx: MutationCtx): Promise<boolean> {
+	try {
+		const metrics = await ctx.meta.getTransactionMetrics();
+		return (
+			metrics.documentsRead.remaining >= RESERVED_ROWS + RETAG_ENTRY_ROWS &&
+			metrics.databaseQueries.remaining >=
+				RESERVED_RANGES + RETAG_ENTRY_RANGES &&
+			metrics.bytesRead.remaining >= RESERVED_BYTES + RETAG_ENTRY_BYTES &&
+			metrics.documentsWritten.remaining >= RETAG_ENTRY_WRITES &&
+			metrics.bytesWritten.remaining >= RETAG_ENTRY_BYTES
+		);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Tag the postings of a namespace's Entries written before 0.5.0, in key
+ * order, from their stored fields: what `set` does for an unchanged Entry
+ * (including handing a retag of more than SYNC_PATCH_LIMIT postings to the
+ * reaper). Tagged Entries cost a doc row and one posting row. Each call
+ * handles at least one Entry, then more while the transaction has room for
+ * the largest possible one, up to REAP_BATCH posting writes. Loop until the
+ * returned cursor is null.
+ */
+export const retagNamespace = mutation({
+	args: {
+		namespace: v.string(),
+		cursor: v.optional(v.union(v.string(), v.null())),
+	},
+	returns: v.object({
+		cursor: v.union(v.string(), v.null()),
+		/** Entries this call found untagged and rewrote (or handed to the reaper). */
+		retagged: v.number(),
+	}),
+	handler: async (ctx, args) => {
+		const after = args.cursor ?? null;
+		const docs = ctx.db
+			.query("docs")
+			.withIndex("by_ns_key", (q) =>
+				after === null
+					? q.eq("namespace", args.namespace)
+					: q.eq("namespace", args.namespace).gt("key", after),
+			);
+		let writes = 0;
+		let retagged = 0;
+		for await (const doc of docs) {
+			if (!(await isTagged(ctx, doc.namespace, doc.key, doc.fields))) {
+				writes += (await writePostings(ctx, doc)).written;
+				retagged += 1;
+			}
+			if (writes >= REAP_BATCH || !(await roomForAnotherRetag(ctx))) {
+				return { cursor: doc.key, retagged };
+			}
+		}
+		return { cursor: null, retagged };
+	},
+});
+
+/**
+ * retagNamespace for one key, for migration runners that walk an app table
+ * instead of the namespace. True when the Entry was untagged and its
+ * postings were rewritten (or handed to the reaper).
+ */
+export const retagKey = mutation({
+	args: { namespace: v.string(), key: v.string() },
+	returns: v.boolean(),
+	handler: async (ctx, args) => {
+		const doc = await ctx.db
+			.query("docs")
+			.withIndex("by_ns_key", (q) =>
+				q.eq("namespace", args.namespace).eq("key", args.key),
+			)
+			.unique();
+		if (
+			doc === null ||
+			(await isTagged(ctx, doc.namespace, doc.key, doc.fields))
+		)
+			return false;
+		await writePostings(ctx, doc);
+		return true;
 	},
 });
 

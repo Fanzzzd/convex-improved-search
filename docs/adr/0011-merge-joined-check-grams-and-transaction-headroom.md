@@ -58,6 +58,9 @@ candidates that cluster in doc order, so the docs walk would have reached them
 for free, and reopening on rejected verifications raised W1 from 53 to 65
 ranges. With wasted ranges W1 stays at 53 and W13 drops to 44.
 
+Since ADR-0014 a probe reads 8 rows of each Gram before the sparsest 6 read on
+to 32, and a far docs seek opens a range floored at the next posting.
+
 A check that has judged 64 candidates without rejecting one is dropped: its rows
 buy nothing (W11's three checks, which every Entry holds).
 
@@ -97,7 +100,8 @@ ignores the tags of those Entries. Past 64 such rows it ignores all tags.
 
 Postings written before 0.5.0 have no tag and allow every Field. An unchanged
 `set` reads one posting to detect them, so re-running a backfill tags an
-existing namespace.
+existing namespace. `retagNamespace` runs the same check and rewrite over a
+namespace's docs in key order, from their stored fields, in bounded batches.
 
 Single-codepoint queries skip tags: each g1 row tags its own Gram, and only the
 union over an Entry's rows would describe the codepoint.

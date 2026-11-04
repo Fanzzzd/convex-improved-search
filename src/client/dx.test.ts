@@ -8,7 +8,14 @@ import type { ComponentApi } from "./index.js";
  * table.
  */
 const component = {
-	lib: { search: "search", set: "set", remove: "remove", get: "get" },
+	lib: {
+		search: "search",
+		set: "set",
+		remove: "remove",
+		get: "get",
+		retagNamespace: "retagNamespace",
+		retagKey: "retagKey",
+	},
 } as unknown as ComponentApi;
 
 type Note = {
@@ -54,6 +61,44 @@ function makeIndexer(rows: Record<string, Note>) {
 	});
 	return { index, indexer, ctx, mutations, setSearchResult };
 }
+
+describe("retag", () => {
+	test("retags the index's namespace from the given cursor", async () => {
+		const { index, ctx, mutations } = makeIndexer({});
+		await index.retag(ctx as never, { cursor: "k9" });
+		await index.retag(ctx as never);
+		expect(mutations).toEqual([
+			{ ref: "retagNamespace", args: { namespace: "notes", cursor: "k9" } },
+			{
+				ref: "retagNamespace",
+				args: { namespace: "notes", cursor: undefined },
+			},
+		]);
+	});
+
+	test("retagKey retags one key of the index's namespace", async () => {
+		const { index, ctx, mutations } = makeIndexer({});
+		await index.retagKey(ctx as never, { key: "k1" });
+		expect(mutations).toEqual([
+			{ ref: "retagKey", args: { namespace: "notes", key: "k1" } },
+		]);
+	});
+
+	test("an entry from get goes back into set without a cast", async () => {
+		const index = new SearchIndex<"section">(component, { name: "notes" });
+		// The typecheck of the set call is the test; the mock's get finds nothing.
+		const { ctx, setSearchResult } = makeCtx({});
+		setSearchResult(null);
+		const entry = await index.get(ctx as never, { key: "k1" });
+		if (entry !== null)
+			await index.set(ctx as never, {
+				key: "k1",
+				text: entry.fields,
+				sortKey: entry.sortKey,
+				filters: entry.filters,
+			});
+	});
+});
 
 describe("tableIndexer trigger", () => {
 	const change = (

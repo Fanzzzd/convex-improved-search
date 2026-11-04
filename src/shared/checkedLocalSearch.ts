@@ -21,14 +21,24 @@ type SearchArgs = {
 // Keep the checked reader's private initialization off the independent path.
 export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 	/**
-	 * Gram selection. A probe reads the first PROBE_ROWS postings of one query
-	 * gram after the cursor. The sparsest gram becomes the candidate stream and
+	 * Gram selection. A probe reads the first postings of each query gram after
+	 * the cursor (PROBE_FIRST_ROWS, then PROBE_ROWS for the sparsest
+	 * PROBE_DEEP). The sparsest gram becomes the candidate stream and
 	 * the next CHECK_GRAMS sparsest are merge-joined against it. Queries with
 	 * more distinct grams than MAX_PROBE_GRAMS probe an evenly spaced subset.
 	 */
 	const MAX_PROBE_GRAMS = 16;
 
 	const PROBE_ROWS = 32;
+
+	/** Rows every probed gram reads before the sparsest PROBE_DEEP read on. */
+	const PROBE_FIRST_ROWS = 8;
+
+	/**
+	 * Grams that read on to PROBE_ROWS: the plan's CHECK_GRAMS + 1 and two
+	 * more, since 8 rows misrank a gram whose first rows cluster.
+	 */
+	const PROBE_DEEP = 6;
 
 	const CHECK_GRAMS = 3;
 
@@ -87,6 +97,15 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 	 */
 	const HARD_RESERVED_BYTES = RESERVED_BYTES + 1024 * 1024;
 
+	/**
+	 * The read guard answers from its own count until the estimate comes
+	 * within this many bytes of HARD_RESERVED_BYTES (one more max-size row),
+	 * or this many rows went by since it last asked the engine.
+	 */
+	const RECHECK_BYTES = 1024 * 1024;
+
+	const RECHECK_ROWS = 64;
+
 	/** Entries mid-retag a namespace may hold before search stops trusting any tag. */
 	const MAX_RETAGGING = 64;
 
@@ -96,6 +115,20 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 	 * cheaper than walking several of them past a sparse hit.
 	 */
 	const WALK_BYTES = 16 * 1024;
+
+	/**
+	 * Limit of a docs range in postings mode: the walk and its target. Convex
+	 * fetches 100 rows per round trip from persistence when a query sets no
+	 * limit, and a limit lowers the fetch to itself. A range that reaches its
+	 * limit costs one more range to go on, so only these ranges take one
+	 * (large rows, a few read per reopen), and a stream whose range reached it
+	 * walks long runs and takes none from then on. Posting rows are small, and
+	 * docs mode reads long runs.
+	 */
+	const DOC_LIMIT = DOC_LEAP_ROWS + 2;
+
+	/** Far candidates whose docs are read by key together. */
+	const DOC_BATCH = 8;
 
 	/** Convex's per-transaction limits, for a backend without getTransactionMetrics. */
 	const TRANSACTION_RANGES = 4096;
@@ -129,7 +162,14 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 	 * when it ended walking docs alone. `z: 1` marks s = -0, which JSON drops
 	 * but index order keeps below 0.
 	 */
-	type Cursor = { s: number; k: string; g?: string[]; d?: 1 };
+	type Cursor = {
+		s: number;
+		k: string;
+		g?: string[];
+		/** Per Check Gram of `g`: candidates it judged on earlier pages without rejecting one. */
+		j?: number[];
+		d?: 1;
+	};
 
 	type Posting = Doc<"postings">;
 
@@ -166,7 +206,14 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 			}
 			const negativeZero =
 				(parsed as { z?: unknown }).z === 1 && parsed.s === 0;
-			const plan = isPlan(parsed.g) ? { g: parsed.g } : {};
+			const idle =
+				Array.isArray(parsed.j) &&
+				isPlan(parsed.g) &&
+				parsed.j.length === parsed.g.length - 1 &&
+				parsed.j.every((n) => Number.isSafeInteger(n) && n >= 0)
+					? { j: parsed.j }
+					: {};
+			const plan = isPlan(parsed.g) ? { g: parsed.g, ...idle } : {};
 			const docsOnly = parsed.d === 1 ? { d: 1 as const } : {};
 			return {
 				s: negativeZero ? -0 : parsed.s,
@@ -186,6 +233,14 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 			if (typeof value === "number" && !Number.isFinite(value)) {
 				throw new ConvexError(`Filter "${field}" must be a finite number`);
 			}
+		}
+	}
+
+	function assertFiniteSortKey(posting: Posting) {
+		if (!Number.isFinite(posting.sortKey)) {
+			throw new ConvexError(
+				`Indexed document "${posting.key}" has a non-finite sortKey; re-set or remove it`,
+			);
 		}
 	}
 
@@ -238,24 +293,44 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 	}
 
 	/**
-	 * What one call may still spend: rows, index ranges and bytes, charged in
-	 * one place for every stream. A row is charged before it is read (so a
-	 * stream never reads past the cap) and its bytes after, so the bytes cap
-	 * can overshoot by one row.
-	 */
-	/**
 	 * The transaction's actual remaining bytes, checked before each optional
 	 * row. ctx.meta calls read no rows. Without getTransactionMetrics every
 	 * row is allowed and only the estimate-based caps apply.
 	 */
 	class ReadGuard {
 		private noMetrics = false;
+		/** Remaining bytes at the last metrics call, and estimates spent since. */
+		private known: number | null = null;
+		private since = 0;
+		private rowsSince = 0;
 		constructor(private readonly ctx: QueryCtx) {}
+		/** Estimated bytes of a row this call read. */
+		spent(bytes: number) {
+			this.since += bytes;
+			this.rowsSince += 1;
+		}
+		/**
+		 * Each metrics call is a round trip out of the isolate, as costly as a
+		 * row. So the guard counts down from the last answer by its own
+		 * estimates, and asks again near the reserve (estimates doubled, since
+		 * JSON is not the engine's size), or after RECHECK_ROWS rows, which
+		 * bounds what reads beside this call can add unseen.
+		 */
 		async remainingBytes(): Promise<number | null> {
 			if (this.noMetrics) return null;
+			if (
+				this.known !== null &&
+				this.rowsSince < RECHECK_ROWS &&
+				this.known - 2 * this.since > HARD_RESERVED_BYTES + RECHECK_BYTES
+			)
+				return this.known - this.since;
 			try {
-				return (await this.ctx.meta.getTransactionMetrics()).bytesRead
-					.remaining;
+				this.known = (
+					await this.ctx.meta.getTransactionMetrics()
+				).bytesRead.remaining;
+				this.since = 0;
+				this.rowsSince = 0;
+				return this.known;
 			} catch {
 				this.noMetrics = true;
 				return null;
@@ -268,6 +343,12 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		}
 	}
 
+	/**
+	 * What one call may still spend: rows, index ranges and bytes, charged in
+	 * one place for every stream. A row is charged before it is read (so a
+	 * stream never reads past the cap) and its bytes after, so the bytes cap
+	 * can overshoot by one row.
+	 */
 	class CallBudget {
 		constructor(
 			private rows: number,
@@ -284,6 +365,10 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 			this.rows -= 1;
 			return must || (this.rows >= 0 && this.bytes > 0);
 		}
+		/** Gives back a row taken for a read that found the end of its range. */
+		refundRow() {
+			this.rows += 1;
+		}
 		takeRange(must = false): boolean {
 			this.ranges -= 1;
 			return must || this.ranges >= 0;
@@ -293,6 +378,7 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 			this.bytes -= bytes;
 			this.rowsRead += 1;
 			this.bytesRead += bytes;
+			this.guard.spent(bytes);
 		}
 		/** Rows and bytes every stream has read. */
 		rowsRead = 0;
@@ -304,7 +390,12 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 	 * `sortKey`'s tie group with key ≤ / < `key`.
 	 */
 	type Seek =
-		| { op: "lte" | "lt"; sortKey: number }
+		| {
+				op: "lte" | "lt";
+				sortKey: number;
+				/** Rows below this sortKey stay out of the range (its whole tie group is in). */
+				floor?: number;
+		  }
 		| { op: "tieLte" | "tieLt"; sortKey: number; key: string };
 
 	/** by_ns_gram and by_ns_g1 after their two equality fields: both end in (sortKey, key). */
@@ -316,6 +407,13 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 			lte(field: "key", value: string): IndexRange;
 			lt(field: "key", value: string): IndexRange;
 		};
+		gte(
+			field: "sortKey",
+			value: number,
+		): {
+			lte(field: "sortKey", value: number): IndexRange;
+			lt(field: "sortKey", value: number): IndexRange;
+		};
 		lte(field: "sortKey", value: number): IndexRange;
 		lt(field: "sortKey", value: number): IndexRange;
 	}
@@ -324,9 +422,13 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		if (seek === null) return q;
 		switch (seek.op) {
 			case "lte":
-				return q.lte("sortKey", seek.sortKey);
+				return seek.floor === undefined
+					? q.lte("sortKey", seek.sortKey)
+					: q.gte("sortKey", seek.floor).lte("sortKey", seek.sortKey);
 			case "lt":
-				return q.lt("sortKey", seek.sortKey);
+				return seek.floor === undefined
+					? q.lt("sortKey", seek.sortKey)
+					: q.gte("sortKey", seek.floor).lt("sortKey", seek.sortKey);
 			case "tieLte":
 				return q.eq("sortKey", seek.sortKey).lte("key", seek.key);
 			case "tieLt":
@@ -353,6 +455,33 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 						applySeek(q.eq("namespace", namespace).eq("g1", of.g1), seek),
 					);
 		return ranged.order("desc");
+	}
+
+	/**
+	 * `range` limited to `limit` rows, or whole when the limit is null.
+	 * `limit` is the query operator `take` is built on; Convex's public types
+	 * leave it out, so a backend without it reads ranges whole.
+	 */
+	type Limitable<Row> = AsyncIterable<Row> & {
+		limit?: (n: number) => AsyncIterable<Row>;
+	};
+	function limited<Row>(
+		range: AsyncIterable<Row>,
+		limit: number | null,
+	): AsyncIterator<Row> {
+		const { limit: withLimit } = range as Limitable<Row>;
+		return (
+			limit === null || withLimit === undefined
+				? range
+				: withLimit.call(range, limit)
+		)[Symbol.asyncIterator]();
+	}
+	/** Whether this backend's queries take a limit (see `limited`). */
+	function canLimit(ctx: { db: QueryCtx["db"] }): boolean {
+		const { limit } = ctx.db
+			.query("docs")
+			.withIndex("by_ns_sort") as Limitable<unknown>;
+		return typeof limit === "function";
 	}
 
 	/** At most `max` items, evenly spaced, first and last included. */
@@ -398,55 +527,89 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 				(remaining === null || remaining > HARD_RESERVED_BYTES)
 			);
 		};
-		const probed: {
+		type Probe = {
 			gram: string;
 			rows: number;
+			/** Read to `upTo` rows or to the end of its range. */
 			complete: boolean;
+			/** Read to the end of its range. */
+			exhausted: boolean;
 			last: Posting | null;
-		}[] = [];
-		for (const gram of spread(grams, MAX_PROBE_GRAMS)) {
-			if (!(await affordable())) break;
-			const rows = postingRange(ctx, namespace, { gram }, seek)[
-				Symbol.asyncIterator
-			]();
-			let count = 0;
-			let last: Posting | null = null;
-			let complete = false;
-			while (true) {
-				const next = await rows.next();
+			/** Opened on its first read. */
+			iterator: AsyncIterator<Posting> | null;
+		};
+		/** Reads `probe` on to `upTo` rows; false when the bytes ran out first. */
+		const advance = async (probe: Probe, upTo: number) => {
+			probe.complete = false;
+			probe.iterator ??= limited(
+				postingRange(ctx, namespace, { gram: probe.gram }, seek),
+				PROBE_ROWS,
+			);
+			while (probe.rows < upTo) {
+				const next = await probe.iterator.next();
 				if (next.done) {
-					complete = true;
+					probe.exhausted = true;
 					break;
 				}
-				count += 1;
-				last = next.value;
-				estimated += rowBytes(next.value);
-				if (count >= PROBE_ROWS) {
-					complete = true;
-					break;
-				}
-				if (!(await affordable())) break;
+				probe.rows += 1;
+				probe.last = next.value;
+				const bytes = rowBytes(next.value);
+				estimated += bytes;
+				guard.spent(bytes);
+				if (probe.rows < upTo && !(await affordable())) return false;
 			}
-			probed.push({ gram, rows: count, complete, last });
-			if (!complete) break;
-		}
-		const short = (p: { rows: number; complete: boolean }) =>
-			p.complete && p.rows < PROBE_ROWS;
-		return probed.sort((a, b) => {
-			if (short(a) || short(b)) {
-				if (short(a) && short(b)) return a.rows - b.rows;
-				return short(a) ? -1 : 1;
+			probe.complete = true;
+			return true;
+		};
+		// Sparser first: a gram whose range ended, by its rows; then the
+		// one whose last row read lies further back.
+		const sparser = (a: Probe, b: Probe) => {
+			if (a.exhausted || b.exhausted) {
+				if (a.exhausted && b.exhausted) return a.rows - b.rows;
+				return a.exhausted ? -1 : 1;
 			}
 			return a.last === null || b.last === null
 				? 0
 				: comparePositions(a.last, b.last);
-		});
+		};
+		// Every gram's first PROBE_FIRST_ROWS rank them; only the sparsest
+		// PROBE_DEEP read on to PROBE_ROWS and are ranked again. A gram dense
+		// near the cursor costs its first rows, not all of them. The grams
+		// read side by side: Convex batches reads that are pending together
+		// into one round trip, and each probe still stops at the byte cap.
+		const all: Probe[] = spread(grams, MAX_PROBE_GRAMS).map((gram) => ({
+			gram,
+			rows: 0,
+			complete: false,
+			exhausted: false,
+			last: null,
+			iterator: null,
+		}));
+		if (await affordable())
+			await Promise.all(all.map((probe) => advance(probe, PROBE_FIRST_ROWS)));
+		// A gram with no row read is left out entirely.
+		const probed = all.filter((probe) => probe.rows > 0 || probe.complete);
+		probed.sort(sparser);
+		const deep = probed.slice(0, PROBE_DEEP);
+		if (await affordable())
+			await Promise.all(
+				deep
+					.filter((probe) => probe.complete && !probe.exhausted)
+					.map((probe) => advance(probe, PROBE_ROWS)),
+			);
+		deep.sort(sparser);
+		for (const probe of all) void probe.iterator?.return?.();
+		return [...deep, ...probed.slice(PROBE_DEEP)].map((probe) => ({
+			gram: probe.gram,
+			rows: probe.rows,
+			complete: probe.complete,
+		}));
 	}
 
 	/** What a stream spends through: `must` spends past zero and still succeeds. */
 	type Budget = Pick<
 		CallBudget,
-		"takeRow" | "takeRange" | "spendRead" | "allowsRead"
+		"takeRow" | "refundRow" | "takeRange" | "spendRead" | "allowsRead"
 	>;
 
 	type SeekOptions = {
@@ -458,6 +621,19 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		walk?: number;
 		/** False: give up after `walk` rows instead of reopening. */
 		reopen?: boolean;
+		/**
+		 * Reopen at once when, by the sortKey spacing of the rows this stream
+		 * read in sequence, the target lies more than twice the walk away: each
+		 * walked row is a round trip the reopen makes anyway.
+		 */
+		skipFar?: boolean;
+		/**
+		 * Asked only when the seek reopens at a far target: a sortKey at or
+		 * below the target that no later seek needs rows above, or null. The
+		 * reopened range stops there, so the engine reads only what lies
+		 * between.
+		 */
+		floor?: () => Promise<number | null>;
 	};
 
 	/**
@@ -483,6 +659,8 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		/** Current row; null at the end. Meaningless while `below` is set. */
 		private current: Row | null = null;
 		private currentBytes = 0;
+		/** Bytes of the last row read1 returned (the lookahead, when there is one). */
+		private readBytes = 0;
 		/** Ranges this stream has opened, and rows and bytes it has read. */
 		opened = 0;
 		read = 0;
@@ -492,14 +670,46 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		 * reopen counts as one more walk: a lower bound, near enough.
 		 */
 		skipped = 0;
+		/**
+		 * Ranges opened only to go on below a floored range: the floor is this
+		 * call's choice, so they are no evidence of a far target.
+		 */
+		floorReopens = 0;
 		/** Set when every row at this sortKey or above is behind the stream and the rest is unopened. */
 		private below: number | null = null;
+		/** `below` was set by a floored range ending, not a tie range. */
+		private belowFloor = false;
 		/** The sortKey the open range is confined to, when it is an exact (tie group) range. */
 		private tieGroup: number | null = null;
+		/** The lowest sortKey the open range reaches, when it has a floor. */
+		private rangeFloor: number | null = null;
+		/** The row after `current`, already read and charged. */
+		private lookahead: IteratorResult<Row> | null = null;
+		/** What the open range was opened with, its limit, and the rows it returned. */
+		private rangeSeek: Seek | null = null;
+		private rangeLimit: number | null = null;
+		private rangeRows = 0;
+		private rangeLast: Row | null = null;
+		/** Rows of a continued range at or above this one were read before. */
+		private skipThrough: Row | null = null;
+		/** SortKey steps between rows read in sequence, summed, and their count. */
+		private spacing = 0;
+		private steps = 0;
+		/** A range of this stream reached its limit: it walks long runs, and later ranges take none. */
+		private walksRuns = false;
+		/** A point read left the stream with no range open. */
+		private detached = false;
 
 		constructor(
-			private readonly open: (seek: Seek | null) => AsyncIterator<Row>,
+			private readonly open: (
+				seek: Seek | null,
+				limit: number | null,
+			) => AsyncIterator<Row>,
 			private readonly budget: Budget,
+			/** The limit of a range opened now; null for none. */
+			private readonly limit: () => number | null,
+			/** Reads the row at a position by key, for streams that can (docs). */
+			private readonly point?: (at: Position) => Promise<Row | null>,
 		) {}
 
 		/** The current row, or null at the end. Only valid after a successful seek/next. */
@@ -507,17 +717,114 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 			return this.current;
 		}
 
+		/** A point read left the stream with nothing open: its targets have been far apart. */
+		get isDetached(): boolean {
+			return this.detached;
+		}
+
+		/** Mean sortKey step between rows read in sequence, or null before two. */
+		get step(): number | null {
+			return this.steps >= 2 && this.spacing > 0
+				? this.spacing / this.steps
+				: null;
+		}
+
+		/**
+		 * Reads the row at each target by key, all at once (one round trip),
+		 * and leaves the stream with nothing open, as a point read in `seek`
+		 * does. Each entry is the row at that target or null (none there, or
+		 * the row moved). Null when the budget cannot pay for all of them.
+		 */
+		async readAll(targets: Position[]): Promise<(Row | null)[] | null> {
+			return await this.readByKey(targets, false, DOC_LEAP_ROWS);
+		}
+
+		/** `readAll`, for `seek` too: each key read counts as a reopen that jumped `walk` rows. */
+		private async readByKey(
+			targets: Position[],
+			must: boolean,
+			walk: number,
+		): Promise<(Row | null)[] | null> {
+			const point = this.point;
+			if (point === undefined) return null;
+			for (const _ of targets)
+				if (!this.budget.takeRange(must) || !this.budget.takeRow(must))
+					return null;
+			if (!(await this.budget.allowsRead())) return null;
+			this.close();
+			this.detached = true;
+			this.lookahead = null;
+			this.below = null;
+			this.tieGroup = null;
+			this.rangeFloor = null;
+			this.rangeLimit = null;
+			this.rangeLast = null;
+			this.current = null;
+			this.opened += targets.length;
+			this.skipped += targets.length * walk;
+			const rows = await Promise.all(targets.map((at) => point(at)));
+			return rows.map((row, i) => {
+				const bytes = row === null ? 0 : rowBytes(row);
+				this.read += 1;
+				this.bytes += bytes;
+				this.currentBytes = bytes;
+				this.budget.spendRead(bytes);
+				return row !== null && comparePositions(row, targets[i]!) === 0
+					? row
+					: null;
+			});
+		}
+
 		/** Positions the stream at its first row ≤ target (`inclusive`) or < target. False when the budget ran out. */
 		async seek(
 			target: Position | null,
-			{ inclusive, must = false, walk = LEAP_ROWS, reopen = true }: SeekOptions,
+			{
+				inclusive,
+				must = false,
+				walk = LEAP_ROWS,
+				reopen = true,
+				floor,
+				skipFar = false,
+			}: SeekOptions,
 		): Promise<boolean> {
 			const beyond = (row: Position) => {
 				const order = comparePositions(row, target!);
 				return inclusive ? order > 0 : order >= 0;
 			};
+			const bounded = async (sortKey: number) => {
+				const at = floor === undefined ? null : await floor();
+				return at !== null && compareValues(at, sortKey) <= 0
+					? { floor: at }
+					: {};
+			};
+			// A far target whose next posting lies far below it too: no later
+			// seek needs a row of the range a reopen would open, so read the
+			// target alone by key and leave the stream with nothing open. Null
+			// when this seek cannot.
+			const pointRead = async (): Promise<boolean | null> => {
+				if (this.point === undefined || !skipFar || !inclusive || !target)
+					return null;
+				const at = floor === undefined ? null : await floor();
+				const step = this.step;
+				if (
+					at !== null &&
+					(step === null || target.sortKey - at <= step * walk * 2)
+				)
+					return null;
+				const rows = await this.readByKey([target], must, walk);
+				if (rows === null) return false;
+				this.current = rows[0]!;
+				return true;
+			};
 			let stage: "walk" | "sortKey" | "exact" = "walk";
 			if (this.rows === null) {
+				// Only a stream an earlier point read left with nothing open:
+				// deciding asks for the floor, a row a first open never read
+				// (pages of 1 read 20% more rows).
+				if (this.detached) {
+					const read = await pointRead();
+					if (read !== null) return read;
+				}
 				stage = "sortKey";
 				const seek: Seek | null =
 					target === null ? null : { op: "lte", sortKey: target.sortKey };
@@ -534,6 +841,15 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 					continue;
 				}
 				if (this.current === null || !beyond(this.current)) return true;
+				const step = this.step;
+				if (
+					skipFar &&
+					stage === "walk" &&
+					walked === 0 &&
+					step !== null &&
+					this.current.sortKey - target.sortKey > step * walk * 2
+				)
+					walked = walk;
 				if (
 					(walked >= walk || walkedBytes >= WALK_BYTES) &&
 					stage !== "exact"
@@ -545,9 +861,18 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 					const inTieGroup =
 						compareValues(this.current.sortKey, target.sortKey) === 0;
 					if (stage === "walk" && !inTieGroup) {
+						const read = await pointRead();
+						if (read !== null) return read;
 						stage = "sortKey";
 						if (
-							!(await this.reopen({ op: "lte", sortKey: target.sortKey }, must))
+							!(await this.reopen(
+								{
+									op: "lte",
+									sortKey: target.sortKey,
+									...(await bounded(target.sortKey)),
+								},
+								must,
+							))
 						)
 							return false;
 					} else {
@@ -577,32 +902,140 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		/** Makes `head` the real next row after a seek that left the stream below a tie group. */
 		async land(must: boolean): Promise<boolean> {
 			if (this.below === null) return true;
+			if (this.belowFloor) this.floorReopens += 1;
 			return await this.reopen({ op: "lt", sortKey: this.below }, must);
 		}
 
 		private async reopen(seek: Seek | null, must: boolean): Promise<boolean> {
 			if (!this.budget.takeRange(must)) return false;
 			this.opened += 1;
-			this.rows = this.open(seek);
+			this.detached = false;
+			this.rangeSeek = seek;
+			this.rangeLimit = this.walksRuns ? null : this.limit();
+			this.rangeRows = 0;
+			this.rangeLast = null;
+			this.skipThrough = null;
+			this.close();
+			this.rows = this.open(seek, this.rangeLimit);
+			this.lookahead = null;
 			this.below = null;
 			this.tieGroup =
 				seek?.op === "tieLte" || seek?.op === "tieLt" ? seek.sortKey : null;
+			this.rangeFloor =
+				(seek?.op === "lte" || seek?.op === "lt") && seek.floor !== undefined
+					? seek.floor
+					: null;
 			return await this.advance(must);
 		}
 
+		/**
+		 * The sortKey of the row after the head: read now, charged now, and
+		 * the head when the stream moves on. Null at the end of the open
+		 * range, or when the budget cannot pay for the row.
+		 */
+		async peekSortKey(): Promise<number | null> {
+			if (this.rows === null || this.below !== null || this.current === null)
+				return null;
+			if (this.lookahead === null) {
+				const read = await this.read1(false);
+				if (read === null) return null;
+				this.lookahead = read;
+			}
+			return this.lookahead.done ? null : this.lookahead.value.sortKey;
+		}
+
+		/** Reads and charges one row of the open range; null when the budget refuses. */
+		private async read1(must: boolean): Promise<IteratorResult<Row> | null> {
+			while (true) {
+				if (this.rangeLimit !== null && this.rangeRows === this.rangeLimit) {
+					if (!(await this.continueRange(must))) return null;
+				}
+				if (!this.budget.takeRow(must)) return null;
+				// Actual bytes, checked even under `must`: a cursor prefix or check
+				// stream can hold arbitrarily wide rows.
+				if (!(await this.budget.allowsRead())) return null;
+				const next = await this.rows!.next();
+				// A floored range ending reads no row: its floor is a choice of this
+				// call's, so it must not cost a budget the unfloored range would keep.
+				if (next.done && this.rangeFloor !== null) {
+					this.budget.refundRow();
+					return next;
+				}
+				this.read += 1;
+				const bytes = next.done ? 0 : rowBytes(next.value);
+				this.readBytes = bytes;
+				this.bytes += bytes;
+				this.budget.spendRead(bytes);
+				if (next.done) return next;
+				this.rangeRows += 1;
+				// A continued range starts at its predecessor's last sortKey, so
+				// it reads that row (and any tied above it) again.
+				if (
+					this.skipThrough !== null &&
+					comparePositions(next.value, this.skipThrough) >= 0
+				)
+					continue;
+				this.skipThrough = null;
+				if (this.rangeLast !== null) {
+					const step = this.rangeLast.sortKey - next.value.sortKey;
+					if (Number.isFinite(step)) {
+						this.spacing += step;
+						this.steps += 1;
+					}
+				}
+				this.rangeLast = next.value;
+				return next;
+			}
+		}
+
+		/**
+		 * The open range stopped at its limit, not its end: open the rest, after
+		 * its last row, with no limit. A tie range continues exactly; any other
+		 * range from the last row's sortKey, skipping what it already returned.
+		 */
+		private async continueRange(must: boolean): Promise<boolean> {
+			if (!this.budget.takeRange(must)) return false;
+			const last = this.rangeLast!;
+			const seek = this.rangeSeek;
+			if (seek?.op === "tieLte" || seek?.op === "tieLt") {
+				this.rangeSeek = { op: "tieLt", sortKey: seek.sortKey, key: last.key };
+				this.skipThrough = null;
+			} else {
+				this.rangeSeek = {
+					op: "lte",
+					sortKey: last.sortKey,
+					...(this.rangeFloor === null ? {} : { floor: this.rangeFloor }),
+				};
+				this.skipThrough = last;
+			}
+			this.walksRuns = true;
+			this.rangeLimit = null;
+			this.rangeRows = 0;
+			this.close();
+			this.rows = this.open(this.rangeSeek, this.rangeLimit);
+			return true;
+		}
+
+		/**
+		 * Ends the open range's query. A range left unfinished keeps its query,
+		 * and the rows Convex fetched ahead for it, until the function ends.
+		 */
+		close() {
+			void this.rows?.return?.();
+			this.rows = null;
+		}
+
 		private async advance(must: boolean): Promise<boolean> {
-			if (!this.budget.takeRow(must)) return false;
-			// Actual bytes, checked even under `must`: a cursor prefix or check
-			// stream can hold arbitrarily wide rows.
-			if (!(await this.budget.allowsRead())) return false;
-			const next = await this.rows!.next();
-			this.read += 1;
+			const next = this.lookahead ?? (await this.read1(must));
+			this.lookahead = null;
+			if (next === null) return false;
 			this.current = next.done ? null : next.value;
-			this.currentBytes = next.done ? 0 : rowBytes(next.value);
-			this.bytes += this.currentBytes;
-			this.budget.spendRead(this.currentBytes);
-			// A tie range ending is not the end of the postings.
-			if (next.done && this.tieGroup !== null) this.below = this.tieGroup;
+			this.currentBytes = next.done ? 0 : this.readBytes;
+			// A tie range or a floored range ending is not the end of the postings.
+			if (next.done) {
+				this.below = this.tieGroup ?? this.rangeFloor;
+				this.belowFloor = this.tieGroup === null && this.rangeFloor !== null;
+			}
 			return true;
 		}
 	}
@@ -616,6 +1049,8 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		rejected: number;
 		/** Candidates its tags rejected (the gram is in no Field holding the others). */
 		narrowed: number;
+		/** Candidates it judged on earlier pages of this plan without rejecting one. */
+		idle: number;
 		/** Wasted ranges to wait for after the stream fell behind, doubling each time. */
 		backoff: number;
 		/** Sit out candidates until the call has wasted this many ranges. */
@@ -694,33 +1129,55 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		};
 		if (!(await narrow(posting))) return false;
 		const drop = (check: Check) => checks.splice(checks.indexOf(check), 1);
-		for (const check of [...checks]) {
-			// A check stream that cannot walk to P cannot reject it for less than
-			// the one range the doc stream spends deciding, and walking on from
-			// behind would spend rows on every later candidate too. So it sits
-			// out until the docs stream has spent `backoff` more ranges on
-			// candidates their doc rejected (doubling each time), then reopens
-			// once: a check that is dense here can still be decisive further on,
-			// and those wasted ranges say so. Rejections the docs walk reaches
-			// for free (clustered candidates) are no evidence.
-			if (wasted < check.resumeAt) continue;
-			const { stream } = check;
+		// A check stream that cannot walk to P cannot reject it for less than
+		// the one range the doc stream spends deciding, and walking on from
+		// behind would spend rows on every later candidate too. So it sits
+		// out until the docs stream has spent `backoff` more ranges on
+		// candidates their doc rejected (doubling each time), then reopens
+		// once: a check that is dense here can still be decisive further on,
+		// and those wasted ranges say so. Rejections the docs walk reaches
+		// for free (clustered candidates) are no evidence.
+		const active = checks.filter((check) => wasted >= check.resumeAt);
+		const seekP = (check: Check) => {
 			const reopen = check.reopenNext;
 			check.reopenNext = false;
-			if (
-				!(await stream.seek(posting, {
-					inclusive: true,
-					must: mustDecide,
-					reopen,
-				}))
-			)
-				return null;
-			if (stream.head !== null && comparePositions(stream.head, posting) > 0) {
-				check.resumeAt = wasted + check.backoff;
-				check.backoff *= 2;
-				check.reopenNext = true;
-				continue;
+			return check.stream.seek(posting, {
+				inclusive: true,
+				must: mustDecide,
+				reopen,
+			});
+		};
+		// The first and most selective check seeks alone, then the rest side
+		// by side, one round trip for all, and all are judged in order. A
+		// check that walks toward a candidate an earlier one rejects spends
+		// rows it could have skipped by reopening nearer the next one: all
+		// three side by side, even only while candidates kept passing, put
+		// W19 `07-2607` over 1.05.
+		if (active.length > 0) {
+			if (!(await seekP(active[0]!))) return null;
+			const head = active[0]!.stream.head;
+			if (head === null || comparePositions(head, posting) < 0) {
+				active[0]!.judged += 1;
+				active[0]!.rejected += 1;
+				return false;
 			}
+		}
+		const sought = await Promise.all(active.slice(1).map(seekP));
+		if (sought.includes(false)) return null;
+		// Every check that fell behind sits out, even past an earlier rejection:
+		// left in, it would walk again for every candidate.
+		const behind = (check: Check) =>
+			check.stream.head !== null &&
+			comparePositions(check.stream.head, posting) > 0;
+		for (const check of active) {
+			if (!behind(check)) continue;
+			check.resumeAt = wasted + check.backoff;
+			check.backoff *= 2;
+			check.reopenNext = true;
+		}
+		for (const check of active) {
+			const { stream } = check;
+			if (behind(check)) continue;
 			check.judged += 1;
 			if (
 				stream.head === null ||
@@ -735,7 +1192,7 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 			}
 			if (
 				check.rejected + check.narrowed === 0 &&
-				check.judged >= IDLE_CHECK_JUDGMENTS
+				check.idle + check.judged >= IDLE_CHECK_JUDGMENTS
 			)
 				drop(check);
 		}
@@ -831,6 +1288,8 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 	// page — never affects correctness, only cost.
 	let of: StreamOf;
 	let checkGrams: string[] = [];
+	/** Idle judgments the plan's checks carry from earlier pages. */
+	let carriedIdle: number[] = [];
 	const grams = codepointCount === 1 ? [] : queryGrams(folded);
 	if (codepointCount === 1) {
 		of = { g1: folded };
@@ -847,6 +1306,7 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		// The previous page's plan, when it judged its checks well (below).
 		of = { gram: cursor.g[0] };
 		checkGrams = cursor.g.slice(1);
+		carriedIdle = cursor.j ?? [];
 	} else {
 		// Probes may spend half the byte headroom, so the call that follows
 		// can still decide a candidate even when every posting is wide.
@@ -872,6 +1332,7 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		}
 	}
 	// Every stream of the call (candidates, checks, docs) spends from it.
+	const limits = canLimit(ctx);
 	const callBudget = new CallBudget(
 		Math.max(
 			MIN_STREAM_ROWS,
@@ -884,33 +1345,59 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		headroom.bytes,
 		guard,
 	);
-	const streamOf = (stream: StreamOf) =>
-		new SortedStream<Posting>(
-			(seek) =>
-				postingRange(ctx, args.namespace, stream, seek)[Symbol.asyncIterator](),
+	/** Every stream this call opens, closed before it returns. */
+	const streams: { close(): void }[] = [];
+	const streamOf = (stream: StreamOf) => {
+		const opened = new SortedStream<Posting>(
+			(seek, limit) =>
+				limited(postingRange(ctx, args.namespace, stream, seek), limit),
 			callBudget,
+			() => null,
 		);
+		streams.push(opened);
+		return opened;
+	};
 	let candidates = streamOf(of);
-	const checkOf = (gram: string, stream: SortedStream<Posting>): Check => ({
+	const checkOf = (
+		gram: string,
+		stream: SortedStream<Posting>,
+		idle = 0,
+	): Check => ({
 		gram,
 		stream,
 		judged: 0,
 		rejected: 0,
 		narrowed: 0,
+		idle,
 		backoff: FIRST_BACKOFF,
 		resumeAt: 0,
 		reopenNext: false,
 	});
-	const checks = checkGrams.map((gram) => checkOf(gram, streamOf({ gram })));
-	const docs = new SortedStream<Doc<"docs">>((seek) => {
-		const range = ctx.db
-			.query("docs")
-			.withIndex("by_ns_sort", (q) =>
-				applySeek(q.eq("namespace", args.namespace), seek),
-			)
-			.order("desc");
-		return range[Symbol.asyncIterator]();
-	}, callBudget);
+	const checks = checkGrams.map((gram, i) =>
+		checkOf(gram, streamOf({ gram }), carriedIdle[i] ?? 0),
+	);
+	const docs = new SortedStream<Doc<"docs">>(
+		(seek, limit) =>
+			limited(
+				ctx.db
+					.query("docs")
+					.withIndex("by_ns_sort", (q) =>
+						applySeek(q.eq("namespace", args.namespace), seek),
+					)
+					.order("desc"),
+				limit,
+			),
+		callBudget,
+		() => (limits && !docsOnly ? DOC_LIMIT : null),
+		async (at) =>
+			await ctx.db
+				.query("docs")
+				.withIndex("by_ns_key", (q) =>
+					q.eq("namespace", args.namespace).eq("key", at.key),
+				)
+				.first(),
+	);
+	streams.push(docs);
 	// Read once, on the first rejection by tags: one range, and none for
 	// calls whose tags reject nothing. Too many retags turns tags off, and
 	// so does a read the byte guard cut short: a partial set could reject
@@ -928,6 +1415,7 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 				if (!(await guard.allowsRow())) return null;
 				const next = await rows.next();
 				if (next.done) return keys;
+				guard.spent(rowBytes(next.value));
 				keys.add(next.value.key);
 			}
 			return null;
@@ -1112,14 +1600,12 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 				must: last === null,
 				walk: RESUME_ROWS,
 			})) && (await candidates.land(last === null));
+		/** Far candidates may still have their docs read in batches. */
+		let batching = true;
 		while (more) {
 			const posting = candidates.head;
 			if (posting === null) break;
-			if (!Number.isFinite(posting.sortKey)) {
-				throw new ConvexError(
-					`Indexed document "${posting.key}" has a non-finite sortKey; re-set or remove it`,
-				);
-			}
+			assertFiniteSortKey(posting);
 			// One document can own several adjacent rows at one position in
 			// this stream (all its g1 grams; briefly, duplicates while a reap
 			// is pending).
@@ -1131,16 +1617,118 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 				continue;
 			}
 			if ("gram" in of && posting.fields !== undefined) tagged = true;
-			// g1 rows tag one gram each, not the query codepoint, so tags apply only to gram streams.
+			// Far candidates: each doc is a point read anyway, so the next few
+			// candidates are checked in order and the docs of those that pass
+			// read together, as patched 0.4.0 did, one round trip for all.
+			// Never more than the page or the budget can take, so no doc is
+			// read for a candidate the call won't decide. Ends for the call
+			// once two candidates lie near. Only while every check left has
+			// judged MISJUDGED_AFTER candidates (on this page or carried) and
+			// rejected none: a batch skips the swap and docs-mode judgments
+			// below, and with checks that reject (or sit out and may) it read
+			// docs they would have spared (W1 1.08 of 0.5.0's load).
+			const room = Math.min(DOC_BATCH, limit - page.length, budget - verified);
+			if (
+				batching &&
+				last !== null &&
+				room >= 2 &&
+				docs.isDetached &&
+				checks.every(
+					(check) =>
+						check.rejected + check.narrowed === 0 &&
+						check.idle + check.judged >= MISJUDGED_AFTER,
+				)
+			) {
+				const batch: Posting[] = [posting];
+				while (batch.length < room) {
+					more = await candidates.next();
+					const next = more ? candidates.head : null;
+					if (next === null) break;
+					assertFiniteSortKey(next);
+					if (comparePositions(next, batch.at(-1)!) !== 0) batch.push(next);
+				}
+				const step = docs.step;
+				for (let i = 1; i < batch.length; i++)
+					if (
+						step === null ||
+						batch[i - 1]!.sortKey - batch[i]!.sortKey <=
+							step * DOC_LEAP_ROWS * 2
+					)
+						batching = false;
+				const tagsFor = "gram" in of ? retagging : null;
+				const nominated: boolean[] = [];
+				// The candidate the budget stopped at, undecided.
+				let undecided: Posting | null = null;
+				for (const candidate of batch) {
+					const verdict = await nominate(
+						candidate,
+						wasted,
+						checks,
+						fieldNames,
+						tagsFor,
+						false,
+					);
+					if (verdict === null) {
+						undecided = candidate;
+						break;
+					}
+					nominated.push(verdict);
+				}
+				batch.length = nominated.length;
+				const rows = await docs.readAll(batch.filter((_, i) => nominated[i]));
+				if (rows === null) {
+					last = cursorBefore(posting);
+					exhausted = false;
+					break modes;
+				}
+				let read = 0;
+				for (const [i, candidate] of batch.entries()) {
+					last = cursorAt(candidate);
+					examined += 1;
+					if (!nominated[i]) continue;
+					verified += 1;
+					const matchedFields = verifyCandidate(
+						rows[read++]!,
+						wantedFilters,
+						folded,
+						fieldNames,
+					);
+					if (matchedFields !== null)
+						page.push({
+							key: candidate.key,
+							sortKey: candidate.sortKey,
+							matchedFields,
+						});
+					else wasted += 1;
+				}
+				if (undecided !== null) {
+					last = cursorBefore(undecided);
+					exhausted = false;
+					break modes;
+				}
+				if (page.length >= limit || verified >= budget) {
+					exhausted = false;
+					break modes;
+				}
+				// Past the batch's last posting, unless the range already ended.
+				if (more && candidates.head !== null) more = await candidates.next();
+				continue;
+			}
+			const docRanges = docs.opened - docs.floorReopens;
+			// The doc waits for the checks: read beside them, every rejection
+			// wastes it (W5 and W19 `07-2607` over 1.05).
 			const nominated = await nominate(
 				posting,
 				wasted,
 				checks,
 				fieldNames,
+				// g1 rows tag one gram each, not the query codepoint, so tags apply only to gram streams.
 				"gram" in of ? retagging : null,
 				last === null,
 			);
-			const docRanges = docs.opened;
+			// A far docs seek opens a range floored at the next posting, so the
+			// engine fetches only the docs between. Check streams keep open
+			// ranges (floored, W5 read 1% more).
 			if (
 				nominated === null ||
 				(nominated &&
@@ -1148,6 +1736,8 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 						inclusive: true,
 						must: last === null,
 						walk: DOC_LEAP_ROWS,
+						floor: () => candidates.peekSortKey(),
+						skipFar: true,
 					})))
 			) {
 				last = cursorBefore(posting);
@@ -1175,7 +1765,7 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 						matchedFields,
 					});
 				} else {
-					wasted += docs.opened - docRanges;
+					wasted += docs.opened - docs.floorReopens - docRanges;
 				}
 				if (page.length >= limit || verified >= budget) {
 					exhausted = false;
@@ -1197,7 +1787,12 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 			if (sparser !== undefined && "gram" in of) {
 				checks.splice(checks.indexOf(sparser), 1, checkOf(of.gram, candidates));
 				for (const check of checks)
-					Object.assign(check, { judged: 0, rejected: 0, narrowed: 0 });
+					Object.assign(check, {
+						judged: 0,
+						rejected: 0,
+						narrowed: 0,
+						idle: 0,
+					});
 				of = { gram: sparser.gram };
 				candidates = sparser.stream;
 				more = await candidates.land(false);
@@ -1268,11 +1863,7 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 				(after === null
 					? null
 					: await postingRange(ctx, args.namespace, of, below).first());
-			if (posting !== null && !Number.isFinite(posting.sortKey)) {
-				throw new ConvexError(
-					`Indexed document "${posting.key}" has a non-finite sortKey; re-set or remove it`,
-				);
-			}
+			if (posting !== null) assertFiniteSortKey(posting);
 			candidate = posting;
 			doc =
 				posting === null
@@ -1315,14 +1906,28 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		leaveDocs();
 
 	// Carry the plan forward, minus dropped checks, unless a check still
-	// rejects most of what it judges (the next page probes again). A call
-	// that ended in docs mode tells the next one to start there, and
-	// needs no plan.
+	// rejects most of what it judges (the next page probes again). A check
+	// that rejected nothing carries its judgments across pages where most
+	// verified candidates were hits, so on short pages it is dropped as in
+	// one long call. Where docs reject most of what the checks pass, the
+	// corpus may yet change along the order and give it work, so its count
+	// starts again (W20 at budget 2 took a call more). A call that ended in
+	// docs mode tells the next one to start there, and needs no plan.
+	const hitsMostly = page.length * 2 >= verified;
+	const idle = checks.map((check) =>
+		hitsMostly && check.rejected + check.narrowed === 0
+			? check.idle + check.judged
+			: 0,
+	);
 	const plan = docsOnly
 		? { d: 1 as const }
 		: "gram" in of && grams.length > 1 && !checks.some(isMisjudged)
-			? { g: [of.gram, ...checks.map((check) => check.gram)] }
+			? {
+					g: [of.gram, ...checks.map((check) => check.gram)],
+					...(idle.some((n) => n > 0) ? { j: idle } : {}),
+				}
 			: {};
+	for (const stream of streams) stream.close();
 	return {
 		page,
 		cursor:

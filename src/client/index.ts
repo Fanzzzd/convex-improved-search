@@ -367,12 +367,17 @@ export class SearchIndex<Filter extends string = never> {
 	): Promise<{
 		fields: Record<string, string>;
 		sortKey: number;
-		filters?: Record<string, FilterValue>;
+		filters?: Partial<Record<Filter, FilterValue>>;
 	} | null> {
-		return await ctx.runQuery(this.component.lib.get, {
+		const entry = await ctx.runQuery(this.component.lib.get, {
 			namespace: this.options.name,
 			key: args.key,
 		});
+		// Stored filters are what `set` wrote, so a get result goes back into
+		// set unchanged.
+		return entry as typeof entry & {
+			filters?: Partial<Record<Filter, FilterValue>>;
+		};
 	}
 
 	/**
@@ -391,6 +396,38 @@ export class SearchIndex<Filter extends string = never> {
 		return await ctx.runMutation(this.component.lib.clearNamespace, {
 			namespace: this.options.name,
 			cursor: args?.cursor,
+		});
+	}
+
+	/**
+	 * Tag postings written before 0.5.0, one batch per call, from the stored
+	 * fields; no source table needed. Loop until the returned cursor is null:
+	 *
+	 * ```ts
+	 * let cursor: string | null = null;
+	 * do { ({ cursor } = await notesSearch.retag(ctx, { cursor })); } while (cursor !== null);
+	 * ```
+	 * (Run the loop across scheduled mutations for large namespaces.)
+	 */
+	async retag(
+		ctx: RunMutationCtx,
+		args?: { cursor?: string | null },
+	): Promise<{ cursor: string | null; retagged: number }> {
+		return await ctx.runMutation(this.component.lib.retagNamespace, {
+			namespace: this.options.name,
+			cursor: args?.cursor,
+		});
+	}
+
+	/**
+	 * `retag` for one key, for a migration that walks your table
+	 * (`migrateOne: (ctx, doc) => notesSearch.retagKey(ctx, { key: doc._id })`).
+	 * True when the entry was untagged and is now tagged.
+	 */
+	async retagKey(ctx: RunMutationCtx, args: { key: string }): Promise<boolean> {
+		return await ctx.runMutation(this.component.lib.retagKey, {
+			namespace: this.options.name,
+			key: args.key,
 		});
 	}
 
