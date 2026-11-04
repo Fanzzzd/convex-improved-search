@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.0](https://github.com/Fanzzzd/convex-improved-search/compare/v0.5.2...v0.6.0) (2026-11-04)
+
+
+### Features
+
+* retag a namespace's postings ([550a5a8](https://github.com/Fanzzzd/convex-improved-search/commit/550a5a88add2f29f463c3a80c4d59aee63abca53)), closes [#14](https://github.com/Fanzzzd/convex-improved-search/issues/14)
+* retag one key, and type get's filters ([b50903d](https://github.com/Fanzzzd/convex-improved-search/commit/b50903d97313877d0d1ee43edf08250530f0bfc8))
+
+
+### Performance Improvements
+
+* probe on 8 rows and floor far docs ranges ([cf65eeb](https://github.com/Fanzzzd/convex-improved-search/commit/cf65eebfa3860e5c1d2ee992fa038cfc73d135ab)), closes [#13](https://github.com/Fanzzzd/convex-improved-search/issues/13)
+* size reads for paged persistence ([c8288b6](https://github.com/Fanzzzd/convex-improved-search/commit/c8288b60d81485eaa30bec8aacf458fe7ea8d496))
+
 ## [0.5.2](https://github.com/Fanzzzd/convex-improved-search/compare/v0.5.1...v0.5.2) (2026-11-03)
 
 
