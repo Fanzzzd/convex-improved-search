@@ -429,9 +429,11 @@ continues into older shards with the same cursor contract as
   `retag` reads the stored fields, so it needs no source table, and skips
   entries that are already tagged. For a `ShardedSearchIndex`, run it on each
   shard (`receipts.shard("2026Q3").retag(...)`). For large namespaces, run the
-  loop across scheduled mutations. Re-running your backfill (`syncDoc`/`set`)
-  also tags an unchanged entry. Entries you write after the upgrade are tagged
-  as they are written.
+  loop across scheduled mutations. An unchanged `set` or `syncDoc` also tags its
+  entry, so for a table-backed index the
+  [backfill migration](#backfilling-existing-data) does the same job under
+  `@convex-dev/migrations`: run it once after deploying. Entries you write after
+  the upgrade are tagged as they are written.
 
 - `docs` gains the index `by_ns_sort`. Convex builds it on deploy; there is
   nothing to run.

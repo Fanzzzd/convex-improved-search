@@ -206,3 +206,36 @@ describe("retagNamespace", () => {
 		}
 	}, 60_000);
 });
+
+describe("retagKey", () => {
+	test("tags one untagged Entry, and reports false for tagged, empty and missing keys", async () => {
+		const t = initConvexTest();
+		for (const [key, no] of [
+			["a", "TR-1"],
+			["b", "TR-2"],
+			["empty", ""],
+		]) {
+			await t.mutation(api.lib.set, {
+				namespace: NS,
+				key: key!,
+				fields: fields(no!, ""),
+				sortKey: 1,
+			});
+		}
+		await untag(t, ["a", "b"]);
+		const retag = (key: string) =>
+			t.mutation(api.lib.retagKey, { namespace: NS, key });
+		expect(await retag("a")).toBe(true);
+		expect(await retag("a")).toBe(false);
+		expect(await retag("empty")).toBe(false);
+		expect(await retag("missing")).toBe(false);
+		expect(await wrongTags(t)).toEqual(
+			expect.arrayContaining([expect.stringMatching(/^b:/)]),
+		);
+		expect((await wrongTags(t)).every((row) => row.startsWith("b:"))).toBe(
+			true,
+		);
+		expect(await retag("b")).toBe(true);
+		expect(await wrongTags(t)).toEqual([]);
+	});
+});

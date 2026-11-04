@@ -1578,6 +1578,31 @@ export const retagNamespace = mutation({
 	},
 });
 
+/**
+ * retagNamespace for one key, for migration runners that walk an app table
+ * instead of the namespace. True when the Entry was untagged and its
+ * postings were rewritten (or handed to the reaper).
+ */
+export const retagKey = mutation({
+	args: { namespace: v.string(), key: v.string() },
+	returns: v.boolean(),
+	handler: async (ctx, args) => {
+		const doc = await ctx.db
+			.query("docs")
+			.withIndex("by_ns_key", (q) =>
+				q.eq("namespace", args.namespace).eq("key", args.key),
+			)
+			.unique();
+		if (
+			doc === null ||
+			(await isTagged(ctx, doc.namespace, doc.key, doc.fields))
+		)
+			return false;
+		await writePostings(ctx, doc);
+		return true;
+	},
+});
+
 /** Drift inspection for reconcile recipes: what the index believes about one key. */
 export const get = query({
 	args: { namespace: v.string(), key: v.string() },

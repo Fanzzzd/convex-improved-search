@@ -14,6 +14,7 @@ const component = {
 		remove: "remove",
 		get: "get",
 		retagNamespace: "retagNamespace",
+		retagKey: "retagKey",
 	},
 } as unknown as ComponentApi;
 
@@ -73,6 +74,29 @@ describe("retag", () => {
 				args: { namespace: "notes", cursor: undefined },
 			},
 		]);
+	});
+
+	test("retagKey retags one key of the index's namespace", async () => {
+		const { index, ctx, mutations } = makeIndexer({});
+		await index.retagKey(ctx as never, { key: "k1" });
+		expect(mutations).toEqual([
+			{ ref: "retagKey", args: { namespace: "notes", key: "k1" } },
+		]);
+	});
+
+	test("an entry from get goes back into set without a cast", async () => {
+		const index = new SearchIndex<"section">(component, { name: "notes" });
+		// The typecheck of the set call is the test; the mock's get finds nothing.
+		const { ctx, setSearchResult } = makeCtx({});
+		setSearchResult(null);
+		const entry = await index.get(ctx as never, { key: "k1" });
+		if (entry !== null)
+			await index.set(ctx as never, {
+				key: "k1",
+				text: entry.fields,
+				sortKey: entry.sortKey,
+				filters: entry.filters,
+			});
 	});
 });
 
