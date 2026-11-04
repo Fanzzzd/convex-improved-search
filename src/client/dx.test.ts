@@ -8,7 +8,13 @@ import type { ComponentApi } from "./index.js";
  * table.
  */
 const component = {
-	lib: { search: "search", set: "set", remove: "remove", get: "get" },
+	lib: {
+		search: "search",
+		set: "set",
+		remove: "remove",
+		get: "get",
+		retagNamespace: "retagNamespace",
+	},
 } as unknown as ComponentApi;
 
 type Note = {
@@ -54,6 +60,21 @@ function makeIndexer(rows: Record<string, Note>) {
 	});
 	return { index, indexer, ctx, mutations, setSearchResult };
 }
+
+describe("retag", () => {
+	test("retags the index's namespace from the given cursor", async () => {
+		const { index, ctx, mutations } = makeIndexer({});
+		await index.retag(ctx as never, { cursor: "k9" });
+		await index.retag(ctx as never);
+		expect(mutations).toEqual([
+			{ ref: "retagNamespace", args: { namespace: "notes", cursor: "k9" } },
+			{
+				ref: "retagNamespace",
+				args: { namespace: "notes", cursor: undefined },
+			},
+		]);
+	});
+});
 
 describe("tableIndexer trigger", () => {
 	const change = (

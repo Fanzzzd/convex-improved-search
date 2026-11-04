@@ -97,7 +97,8 @@ ignores the tags of those Entries. Past 64 such rows it ignores all tags.
 
 Postings written before 0.5.0 have no tag and allow every Field. An unchanged
 `set` reads one posting to detect them, so re-running a backfill tags an
-existing namespace.
+existing namespace. `retagNamespace` runs the same check and rewrite over a
+namespace's docs in key order, from their stored fields, in bounded batches.
 
 Single-codepoint queries skip tags: each g1 row tags its own Gram, and only the
 union over an Entry's rows would describe the codepoint.

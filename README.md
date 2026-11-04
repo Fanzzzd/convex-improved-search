@@ -264,6 +264,9 @@ do {
 } while (cursor !== null);
 ```
 
+`notesSearch.retag(ctx, { cursor })` loops the same way and tags postings
+written before 0.5.0 (see [Upgrading to 0.5.0](#upgrading-to-050)).
+
 ### Scaling out: time shards
 
 Past ~100k entries per namespace, partition by time with `ShardedSearchIndex`.
@@ -410,11 +413,26 @@ continues into older shards with the same cursor contract as
 ## Upgrading to 0.5.0
 
 - Posting rows gain an optional `fields` tag. Rows written by earlier versions
-  have none. Search still returns the same results for them; it only cannot drop
-  their other-field candidates early. Re-run your backfill (`syncDoc`/`set`)
-  once to tag them: `set` reads one posting of an unchanged entry, sees the
-  missing tag, and rewrites the tags. Entries you write after the upgrade are
-  tagged as they are written.
+  have none. Search still returns the same results for them, but a query with
+  `fields` cannot drop their other-field candidates before reading their docs,
+  and that can cost several times more: on one 3650-entry index, a query whose
+  text sat only in an unselected field read 575 KB over 2 calls untagged and 76
+  KB in 1 call tagged. Retag right after deploying, one loop per index:
+
+  ```ts
+  let cursor: string | null = null;
+  do {
+    ({ cursor } = await notesSearch.retag(ctx, { cursor }));
+  } while (cursor !== null);
+  ```
+
+  `retag` reads the stored fields, so it needs no source table, and skips
+  entries that are already tagged. For a `ShardedSearchIndex`, run it on each
+  shard (`receipts.shard("2026Q3").retag(...)`). For large namespaces, run the
+  loop across scheduled mutations. Re-running your backfill (`syncDoc`/`set`)
+  also tags an unchanged entry. Entries you write after the upgrade are tagged
+  as they are written.
+
 - `docs` gains the index `by_ns_sort`. Convex builds it on deploy; there is
   nothing to run.
 - The component's `search` result gains `verified`: candidates checked against

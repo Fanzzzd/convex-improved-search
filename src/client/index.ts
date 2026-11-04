@@ -395,6 +395,26 @@ export class SearchIndex<Filter extends string = never> {
 	}
 
 	/**
+	 * Tag postings written before 0.5.0, one batch per call, from the stored
+	 * fields; no source table needed. Loop until the returned cursor is null:
+	 *
+	 * ```ts
+	 * let cursor: string | null = null;
+	 * do { ({ cursor } = await notesSearch.retag(ctx, { cursor })); } while (cursor !== null);
+	 * ```
+	 * (Run the loop across scheduled mutations for large namespaces.)
+	 */
+	async retag(
+		ctx: RunMutationCtx,
+		args?: { cursor?: string | null },
+	): Promise<{ cursor: string | null; retagged: number }> {
+		return await ctx.runMutation(this.component.lib.retagNamespace, {
+			namespace: this.options.name,
+			cursor: args?.cursor,
+		});
+	}
+
+	/**
 	 * Bind this index to one table with one mapper, and every sync path comes
 	 * for free: `sync(ctx, id)` after any write (works for hard deletes too),
 	 * `syncDoc(ctx, doc)` for backfill migrations, and `trigger()` for
