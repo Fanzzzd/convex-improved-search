@@ -21,14 +21,24 @@ type SearchArgs = {
 // Keep the checked reader's private initialization off the independent path.
 export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 	/**
-	 * Gram selection. A probe reads the first PROBE_ROWS postings of one query
-	 * gram after the cursor. The sparsest gram becomes the candidate stream and
+	 * Gram selection. A probe reads the first postings of each query gram after
+	 * the cursor (PROBE_FIRST_ROWS, then PROBE_ROWS for the sparsest
+	 * PROBE_DEEP). The sparsest gram becomes the candidate stream and
 	 * the next CHECK_GRAMS sparsest are merge-joined against it. Queries with
 	 * more distinct grams than MAX_PROBE_GRAMS probe an evenly spaced subset.
 	 */
 	const MAX_PROBE_GRAMS = 16;
 
 	const PROBE_ROWS = 32;
+
+	/** Rows every probed gram reads before the sparsest PROBE_DEEP read on. */
+	const PROBE_FIRST_ROWS = 8;
+
+	/**
+	 * Grams that read on to PROBE_ROWS: the plan's CHECK_GRAMS + 1 and two
+	 * more, since 8 rows misrank a gram whose first rows cluster.
+	 */
+	const PROBE_DEEP = 6;
 
 	const CHECK_GRAMS = 3;
 
@@ -284,6 +294,10 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 			this.rows -= 1;
 			return must || (this.rows >= 0 && this.bytes > 0);
 		}
+		/** Gives back a row taken for a read that found the end of its range. */
+		refundRow() {
+			this.rows += 1;
+		}
 		takeRange(must = false): boolean {
 			this.ranges -= 1;
 			return must || this.ranges >= 0;
@@ -304,7 +318,12 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 	 * `sortKey`'s tie group with key ≤ / < `key`.
 	 */
 	type Seek =
-		| { op: "lte" | "lt"; sortKey: number }
+		| {
+				op: "lte" | "lt";
+				sortKey: number;
+				/** Rows below this sortKey stay out of the range (its whole tie group is in). */
+				floor?: number;
+		  }
 		| { op: "tieLte" | "tieLt"; sortKey: number; key: string };
 
 	/** by_ns_gram and by_ns_g1 after their two equality fields: both end in (sortKey, key). */
@@ -316,6 +335,13 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 			lte(field: "key", value: string): IndexRange;
 			lt(field: "key", value: string): IndexRange;
 		};
+		gte(
+			field: "sortKey",
+			value: number,
+		): {
+			lte(field: "sortKey", value: number): IndexRange;
+			lt(field: "sortKey", value: number): IndexRange;
+		};
 		lte(field: "sortKey", value: number): IndexRange;
 		lt(field: "sortKey", value: number): IndexRange;
 	}
@@ -324,9 +350,13 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		if (seek === null) return q;
 		switch (seek.op) {
 			case "lte":
-				return q.lte("sortKey", seek.sortKey);
+				return seek.floor === undefined
+					? q.lte("sortKey", seek.sortKey)
+					: q.gte("sortKey", seek.floor).lte("sortKey", seek.sortKey);
 			case "lt":
-				return q.lt("sortKey", seek.sortKey);
+				return seek.floor === undefined
+					? q.lt("sortKey", seek.sortKey)
+					: q.gte("sortKey", seek.floor).lt("sortKey", seek.sortKey);
 			case "tieLte":
 				return q.eq("sortKey", seek.sortKey).lte("key", seek.key);
 			case "tieLt":
@@ -398,55 +428,81 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 				(remaining === null || remaining > HARD_RESERVED_BYTES)
 			);
 		};
-		const probed: {
+		type Probe = {
 			gram: string;
 			rows: number;
+			/** Read to `upTo` rows or to the end of its range. */
 			complete: boolean;
+			/** Read to the end of its range. */
+			exhausted: boolean;
 			last: Posting | null;
-		}[] = [];
-		for (const gram of spread(grams, MAX_PROBE_GRAMS)) {
-			if (!(await affordable())) break;
-			const rows = postingRange(ctx, namespace, { gram }, seek)[
-				Symbol.asyncIterator
-			]();
-			let count = 0;
-			let last: Posting | null = null;
-			let complete = false;
-			while (true) {
-				const next = await rows.next();
+			iterator: AsyncIterator<Posting>;
+		};
+		/** Reads `probe` on to `upTo` rows; false when the bytes ran out first. */
+		const advance = async (probe: Probe, upTo: number) => {
+			probe.complete = false;
+			while (probe.rows < upTo) {
+				const next = await probe.iterator.next();
 				if (next.done) {
-					complete = true;
+					probe.exhausted = true;
 					break;
 				}
-				count += 1;
-				last = next.value;
+				probe.rows += 1;
+				probe.last = next.value;
 				estimated += rowBytes(next.value);
-				if (count >= PROBE_ROWS) {
-					complete = true;
-					break;
-				}
-				if (!(await affordable())) break;
+				if (probe.rows < upTo && !(await affordable())) return false;
 			}
-			probed.push({ gram, rows: count, complete, last });
-			if (!complete) break;
-		}
-		const short = (p: { rows: number; complete: boolean }) =>
-			p.complete && p.rows < PROBE_ROWS;
-		return probed.sort((a, b) => {
-			if (short(a) || short(b)) {
-				if (short(a) && short(b)) return a.rows - b.rows;
-				return short(a) ? -1 : 1;
+			probe.complete = true;
+			return true;
+		};
+		// Sparser first: a gram whose range ended, by its rows; then the
+		// one whose last row read lies further back.
+		const sparser = (a: Probe, b: Probe) => {
+			if (a.exhausted || b.exhausted) {
+				if (a.exhausted && b.exhausted) return a.rows - b.rows;
+				return a.exhausted ? -1 : 1;
 			}
 			return a.last === null || b.last === null
 				? 0
 				: comparePositions(a.last, b.last);
-		});
+		};
+		// Every gram's first PROBE_FIRST_ROWS rank them; only the sparsest
+		// PROBE_DEEP read on to PROBE_ROWS and are ranked again. A gram dense
+		// near the cursor costs its first rows, not all of them.
+		const probed: Probe[] = [];
+		for (const gram of spread(grams, MAX_PROBE_GRAMS)) {
+			if (!(await affordable())) break;
+			const probe: Probe = {
+				gram,
+				rows: 0,
+				complete: false,
+				exhausted: false,
+				last: null,
+				iterator: postingRange(ctx, namespace, { gram }, seek)[
+					Symbol.asyncIterator
+				](),
+			};
+			probed.push(probe);
+			if (!(await advance(probe, PROBE_FIRST_ROWS))) break;
+		}
+		probed.sort(sparser);
+		const deep = probed.slice(0, PROBE_DEEP);
+		for (const probe of deep) {
+			if (!probe.complete || probe.exhausted) continue;
+			if (!(await affordable()) || !(await advance(probe, PROBE_ROWS))) break;
+		}
+		deep.sort(sparser);
+		return [...deep, ...probed.slice(PROBE_DEEP)].map((probe) => ({
+			gram: probe.gram,
+			rows: probe.rows,
+			complete: probe.complete,
+		}));
 	}
 
 	/** What a stream spends through: `must` spends past zero and still succeeds. */
 	type Budget = Pick<
 		CallBudget,
-		"takeRow" | "takeRange" | "spendRead" | "allowsRead"
+		"takeRow" | "refundRow" | "takeRange" | "spendRead" | "allowsRead"
 	>;
 
 	type SeekOptions = {
@@ -458,6 +514,13 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		walk?: number;
 		/** False: give up after `walk` rows instead of reopening. */
 		reopen?: boolean;
+		/**
+		 * Asked only when the seek reopens at a far target: a sortKey at or
+		 * below the target that no later seek needs rows above, or null. The
+		 * reopened range stops there, so the engine reads only what lies
+		 * between.
+		 */
+		floor?: () => Promise<number | null>;
 	};
 
 	/**
@@ -492,10 +555,21 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		 * reopen counts as one more walk: a lower bound, near enough.
 		 */
 		skipped = 0;
+		/**
+		 * Ranges opened only to go on below a floored range: the floor is this
+		 * call's choice, so they are no evidence of a far target.
+		 */
+		floorReopens = 0;
 		/** Set when every row at this sortKey or above is behind the stream and the rest is unopened. */
 		private below: number | null = null;
+		/** `below` was set by a floored range ending, not a tie range. */
+		private belowFloor = false;
 		/** The sortKey the open range is confined to, when it is an exact (tie group) range. */
 		private tieGroup: number | null = null;
+		/** The lowest sortKey the open range reaches, when it has a floor. */
+		private rangeFloor: number | null = null;
+		/** The row after `current`, already read and charged. */
+		private lookahead: IteratorResult<Row> | null = null;
 
 		constructor(
 			private readonly open: (seek: Seek | null) => AsyncIterator<Row>,
@@ -510,11 +584,23 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		/** Positions the stream at its first row ≤ target (`inclusive`) or < target. False when the budget ran out. */
 		async seek(
 			target: Position | null,
-			{ inclusive, must = false, walk = LEAP_ROWS, reopen = true }: SeekOptions,
+			{
+				inclusive,
+				must = false,
+				walk = LEAP_ROWS,
+				reopen = true,
+				floor,
+			}: SeekOptions,
 		): Promise<boolean> {
 			const beyond = (row: Position) => {
 				const order = comparePositions(row, target!);
 				return inclusive ? order > 0 : order >= 0;
+			};
+			const bounded = async (sortKey: number) => {
+				const at = floor === undefined ? null : await floor();
+				return at !== null && compareValues(at, sortKey) <= 0
+					? { floor: at }
+					: {};
 			};
 			let stage: "walk" | "sortKey" | "exact" = "walk";
 			if (this.rows === null) {
@@ -547,7 +633,14 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 					if (stage === "walk" && !inTieGroup) {
 						stage = "sortKey";
 						if (
-							!(await this.reopen({ op: "lte", sortKey: target.sortKey }, must))
+							!(await this.reopen(
+								{
+									op: "lte",
+									sortKey: target.sortKey,
+									...(await bounded(target.sortKey)),
+								},
+								must,
+							))
 						)
 							return false;
 					} else {
@@ -577,6 +670,7 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 		/** Makes `head` the real next row after a seek that left the stream below a tie group. */
 		async land(must: boolean): Promise<boolean> {
 			if (this.below === null) return true;
+			if (this.belowFloor) this.floorReopens += 1;
 			return await this.reopen({ op: "lt", sortKey: this.below }, must);
 		}
 
@@ -584,25 +678,64 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 			if (!this.budget.takeRange(must)) return false;
 			this.opened += 1;
 			this.rows = this.open(seek);
+			this.lookahead = null;
 			this.below = null;
 			this.tieGroup =
 				seek?.op === "tieLte" || seek?.op === "tieLt" ? seek.sortKey : null;
+			this.rangeFloor =
+				(seek?.op === "lte" || seek?.op === "lt") && seek.floor !== undefined
+					? seek.floor
+					: null;
 			return await this.advance(must);
 		}
 
-		private async advance(must: boolean): Promise<boolean> {
-			if (!this.budget.takeRow(must)) return false;
+		/**
+		 * The sortKey of the row after the head: read now, charged now, and
+		 * the head when the stream moves on. Null at the end of the open
+		 * range, or when the budget cannot pay for the row.
+		 */
+		async peekSortKey(): Promise<number | null> {
+			if (this.rows === null || this.below !== null || this.current === null)
+				return null;
+			if (this.lookahead === null) {
+				const read = await this.read1(false);
+				if (read === null) return null;
+				this.lookahead = read;
+			}
+			return this.lookahead.done ? null : this.lookahead.value.sortKey;
+		}
+
+		/** Reads and charges one row of the open range; null when the budget refuses. */
+		private async read1(must: boolean): Promise<IteratorResult<Row> | null> {
+			if (!this.budget.takeRow(must)) return null;
 			// Actual bytes, checked even under `must`: a cursor prefix or check
 			// stream can hold arbitrarily wide rows.
-			if (!(await this.budget.allowsRead())) return false;
+			if (!(await this.budget.allowsRead())) return null;
 			const next = await this.rows!.next();
+			// A floored range ending reads no row: its floor is a choice of this
+			// call's, so it must not cost a budget the unfloored range would keep.
+			if (next.done && this.rangeFloor !== null) {
+				this.budget.refundRow();
+				return next;
+			}
 			this.read += 1;
+			const bytes = next.done ? 0 : rowBytes(next.value);
+			this.bytes += bytes;
+			this.budget.spendRead(bytes);
+			return next;
+		}
+
+		private async advance(must: boolean): Promise<boolean> {
+			const next = this.lookahead ?? (await this.read1(must));
+			this.lookahead = null;
+			if (next === null) return false;
 			this.current = next.done ? null : next.value;
 			this.currentBytes = next.done ? 0 : rowBytes(next.value);
-			this.bytes += this.currentBytes;
-			this.budget.spendRead(this.currentBytes);
-			// A tie range ending is not the end of the postings.
-			if (next.done && this.tieGroup !== null) this.below = this.tieGroup;
+			// A tie range or a floored range ending is not the end of the postings.
+			if (next.done) {
+				this.below = this.tieGroup ?? this.rangeFloor;
+				this.belowFloor = this.tieGroup === null && this.rangeFloor !== null;
+			}
 			return true;
 		}
 	}
@@ -1140,7 +1273,11 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 				"gram" in of ? retagging : null,
 				last === null,
 			);
-			const docRanges = docs.opened;
+			const docRanges = docs.opened - docs.floorReopens;
+			// The next posting floors the docs range a far seek opens: the engine
+			// reads ahead of the last row a range returned, and on a range open
+			// to the namespace's end that read-ahead costs several times the rows
+			// used. Check streams keep open ranges (floored, W5 read 1% more).
 			if (
 				nominated === null ||
 				(nominated &&
@@ -1148,6 +1285,7 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 						inclusive: true,
 						must: last === null,
 						walk: DOC_LEAP_ROWS,
+						floor: () => candidates.peekSortKey(),
 					})))
 			) {
 				last = cursorBefore(posting);
@@ -1175,7 +1313,7 @@ export async function checkedSearch(ctx: QueryCtx, args: SearchArgs) {
 						matchedFields,
 					});
 				} else {
-					wasted += docs.opened - docRanges;
+					wasted += docs.opened - docs.floorReopens - docRanges;
 				}
 				if (page.length >= limit || verified >= budget) {
 					exhausted = false;

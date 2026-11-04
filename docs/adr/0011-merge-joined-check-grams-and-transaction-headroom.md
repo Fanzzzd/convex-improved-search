@@ -58,6 +58,9 @@ candidates that cluster in doc order, so the docs walk would have reached them
 for free, and reopening on rejected verifications raised W1 from 53 to 65
 ranges. With wasted ranges W1 stays at 53 and W13 drops to 44.
 
+Since ADR-0014 a probe reads 8 rows of each Gram before the sparsest 6 read on
+to 32, and a far docs seek opens a range floored at the next posting.
+
 A check that has judged 64 candidates without rejecting one is dropped: its rows
 buy nothing (W11's three checks, which every Entry holds).
 
