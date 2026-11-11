@@ -30,7 +30,8 @@
     "test:debug": "vitest --inspect-brk --no-file-parallelism",
     "test:coverage": "vitest run --coverage --coverage.reporter=text",
     "verify:package": "node ./scripts/verify-package.mjs",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "version-packages": "changeset version && npm install --package-lock-only --ignore-scripts --no-audit --no-fund"
   },
   "files": [
     "dist",
@@ -62,6 +63,7 @@
     "convex": "^1.43.0"
   },
   "devDependencies": {
+    "@changesets/cli": "^3.0.3",
     "@convex-dev/eslint-plugin": "^3.0.0",
     "@edge-runtime/vm": "^5.0.0",
     "@types/node": "^24.13.3",

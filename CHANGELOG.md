@@ -1,13 +1,13 @@
 # Changelog
 
-## [0.6.1](https://github.com/Fanzzzd/convex-improved-search/compare/v0.6.0...v0.6.1) (2026-11-11)
+## 0.6.1
 
 
 ### Documentation
 
 * add the Convex components directory badge ([#17](https://github.com/Fanzzzd/convex-improved-search/issues/17)) ([f201f4a](https://github.com/Fanzzzd/convex-improved-search/commit/f201f4a8f06c8905ba3e5cd3b3494ebdb15a922b))
 
-## [0.6.0](https://github.com/Fanzzzd/convex-improved-search/compare/v0.5.2...v0.6.0) (2026-11-04)
+## 0.6.0
 
 
 ### Features
@@ -21,21 +21,21 @@
 * probe on 8 rows and floor far docs ranges ([cf65eeb](https://github.com/Fanzzzd/convex-improved-search/commit/cf65eebfa3860e5c1d2ee992fa038cfc73d135ab)), closes [#13](https://github.com/Fanzzzd/convex-improved-search/issues/13)
 * size reads for paged persistence ([c8288b6](https://github.com/Fanzzzd/convex-improved-search/commit/c8288b60d81485eaa30bec8aacf458fe7ea8d496))
 
-## [0.5.2](https://github.com/Fanzzzd/convex-improved-search/compare/v0.5.1...v0.5.2) (2026-11-03)
+## 0.5.2
 
 
 ### Performance Improvements
 
 * read one-gram candidates' docs by key ([04120bc](https://github.com/Fanzzzd/convex-improved-search/commit/04120bc02ccba444b3c84667a07ebcfe08be6993))
 
-## [0.5.1](https://github.com/Fanzzzd/convex-improved-search/compare/v0.5.0...v0.5.1) (2026-10-31)
+## 0.5.1
 
 
 ### Performance Improvements
 
 * walk 2 docs before reopening at a candidate ([e604659](https://github.com/Fanzzzd/convex-improved-search/commit/e6046591e7e2e84336daec72dda5750a27df659e))
 
-## [0.5.0](https://github.com/Fanzzzd/convex-improved-search/compare/v0.4.0...v0.5.0) (2026-10-30)
+## 0.5.0
 
 
 ### Features
@@ -60,21 +60,21 @@
 * single-gram queries skip the probe; cursor resume walks 64 rows before an exact seek ([59e593d](https://github.com/Fanzzzd/convex-improved-search/commit/59e593d7fa1ad60df72d600290326e97ab2a9408))
 * verify candidates by walking docs in step; check grams never reopen ([4ecd61d](https://github.com/Fanzzzd/convex-improved-search/commit/4ecd61d5df46424f5fc0ca48a602adc69bf0e558))
 
-## [0.4.0](https://github.com/Fanzzzd/convex-improved-search/compare/v0.3.0...v0.4.0) (2026-10-22)
+## 0.4.0
 
 
 ### Features
 
 * fill option for search/searchDocs; set skips the posting diff when text is unchanged ([#5](https://github.com/Fanzzzd/convex-improved-search/issues/5)) ([5af1c41](https://github.com/Fanzzzd/convex-improved-search/commit/5af1c41dfc517973a39095fdd909010b1a48d090)), closes [#4](https://github.com/Fanzzzd/convex-improved-search/issues/4)
 
-## [0.3.0](https://github.com/Fanzzzd/convex-improved-search/compare/v0.2.1...v0.3.0) (2026-10-20)
+## 0.3.0
 
 
 ### Features
 
 * the trigger skips updates whose indexed entry is unchanged ([#2](https://github.com/Fanzzzd/convex-improved-search/issues/2)) ([7306392](https://github.com/Fanzzzd/convex-improved-search/commit/7306392287a25e31c3bc3a07fdcd0dbd33f96a36))
 
-## [0.2.1](https://github.com/Fanzzzd/convex-improved-search/compare/v0.2.0...v0.2.1) (2026-08-16)
+## 0.2.1
 
 
 ### Bug Fixes
