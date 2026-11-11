@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/Fanzzzd/convex-improved-search/compare/v0.6.0...v0.6.1) (2026-11-11)
+
+
+### Documentation
+
+* add the Convex components directory badge ([#17](https://github.com/Fanzzzd/convex-improved-search/issues/17)) ([f201f4a](https://github.com/Fanzzzd/convex-improved-search/commit/f201f4a8f06c8905ba3e5cd3b3494ebdb15a922b))
+
 ## [0.6.0](https://github.com/Fanzzzd/convex-improved-search/compare/v0.5.2...v0.6.0) (2026-11-04)
 
 
