@@ -480,9 +480,9 @@ to npm via [trusted publishing](https://docs.npmjs.com/trusted-publishers)
 (GitHub OIDC — no tokens, provenance included). A failed publish should first be
 rerun from GitHub Actions. If the rerun window has expired, manually dispatch
 the same `Release` workflow with the existing immutable tag; the job verifies
-that the tag and package version agree before publishing. Caveat: the release PR
-itself doesn't trigger the PR test workflow (GitHub doesn't run workflows on
-`GITHUB_TOKEN`-created PRs); the publish job's own gate covers it.
+that the tag and package version agree before publishing. release-please opens
+the release PR with a GitHub App token, so the PR test workflow runs on it
+without manual approval. [PUBLISHING.md](./PUBLISHING.md) lists the App setup.
 
 ## License
 
