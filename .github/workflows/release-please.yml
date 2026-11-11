@@ -15,9 +15,7 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}
@@ -27,14 +25,29 @@ jobs:
   release-please:
     if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
+    # release-please writes with the GitHub App token below, not GITHUB_TOKEN.
+    permissions: {}
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
+      # GitHub holds the checks of a pull request that github-actions[bot]
+      # opens until a maintainer approves them. A release PR opened with a
+      # GitHub App token runs its checks at once. The App needs contents,
+      # pull requests and issues (labels) write on this repository.
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app-token
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
       - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
         id: release
         with:
           release-type: node
+          token: ${{ steps.app-token.outputs.token }}
 
   publish:
     needs: release-please
@@ -54,6 +67,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ env.RELEASE_TAG }}
+          # Later steps run dependency code; keep the token out of .git/config.
+          persist-credentials: false
 
       - name: Verify immutable release version
         run: |
