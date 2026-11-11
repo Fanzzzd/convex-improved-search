@@ -1,6 +1,7 @@
 # convex-improved-search
 
 [![npm version](https://badge.fury.io/js/convex-improved-search.svg)](https://badge.fury.io/js/convex-improved-search)
+[![Convex Component](https://www.convex.dev/components/badge/convex-improved-search)](https://www.convex.dev/components/convex-improved-search)
 
 **Transactional, reactive, exact substring search for Convex — built for the
 languages the built-in search index can't handle.**
