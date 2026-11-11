@@ -67,6 +67,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ env.RELEASE_TAG }}
+          # Later steps run dependency code; keep the token out of .git/config.
+          persist-credentials: false
 
       - name: Verify immutable release version
         run: |
