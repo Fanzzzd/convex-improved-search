@@ -471,18 +471,17 @@ A runnable demo lives in [example/](./example/) — a Vite + React app.
 
 ### Releasing
 
-Conventional commits drive the pipeline: `feat` / `fix` (and breaking `!`)
-commits on `main` make
-[release-please](https://github.com/googleapis/release-please) open or refresh a
-release PR with the version bump and changelog. Merging that PR tags the
-release; the workflow then rebuilds, re-runs the full test gate, and publishes
-to npm via [trusted publishing](https://docs.npmjs.com/trusted-publishers)
-(GitHub OIDC — no tokens, provenance included). A failed publish should first be
-rerun from GitHub Actions. If the rerun window has expired, manually dispatch
-the same `Release` workflow with the existing immutable tag; the job verifies
-that the tag and package version agree before publishing. release-please opens
-the release PR with a GitHub App token, so the PR test workflow runs on it
-without manual approval. [PUBLISHING.md](./PUBLISHING.md) lists the App setup.
+A pull request that changes the package adds a changeset (`npx changeset`). When
+changesets reach `main`, the `Release` workflow opens or refreshes a "chore:
+version packages" PR with the version bump and changelog. Merging it releases
+the new version. A job without publish rights rebuilds, runs the full test gate
+and packs the tarball. A separate job publishes that tarball to npm via
+[trusted publishing](https://docs.npmjs.com/trusted-publishers), with provenance
+and no token. The tag and GitHub release follow. A failed publish should first
+be rerun from GitHub Actions; if the rerun window has expired, manually dispatch
+the same `Release` workflow. [PUBLISHING.md](./PUBLISHING.md) has the details,
+including the GitHub App that opens the version PR so its checks run without
+manual approval.
 
 ## License
 

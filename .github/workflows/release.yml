@@ -1,0 +1,232 @@
+name: Release
+# Changesets keeps a "Version Packages" PR open while .changeset/ holds
+# changesets. Merging it bumps package.json and CHANGELOG.md on main; the next
+# run sees a version npm does not have and releases it. The build job installs,
+# tests and packs without any publish rights; the publish job holds the OIDC
+# id-token, runs no project or dependency code, and ships the tested tarball
+# to npm via trusted publishing (no token, no OTP; the trusted publisher on
+# npmjs.com points at this workflow file). The release job then tags the
+# commit and creates the GitHub release.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description:
+          Check the OIDC token exchange with npm publish --dry-run; upload
+          nothing. Unchecked, publish main's version if npm does not have it.
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    # Forks skip the whole release: it belongs to the upstream repository.
+    if: ${{ github.repository == 'Fanzzzd/convex-improved-search' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # changesets/action writes with the GitHub App token below, not
+    # GITHUB_TOKEN.
+    permissions: {}
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+      version: ${{ steps.mode.outputs.version }}
+    steps:
+      # changesets/action commits through the GitHub API with its token and
+      # never runs git push, so checkout keeps no credentials.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Node setup
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24.x"
+
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      # GitHub holds the checks of a pull request that github-actions[bot]
+      # opens until a maintainer approves them. A Version Packages PR opened
+      # with a GitHub App token runs its checks at once. The App needs
+      # contents and pull requests write on this repository.
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        if: ${{ github.event_name == 'push' }}
+        id: app-token
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open or update the Version Packages PR
+        if: ${{ github.event_name == 'push' }}
+        id: changesets
+        uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          version-script: npm run version-packages
+          commit-message: "chore: version packages"
+          pr-title: "chore: version packages"
+
+      - name: Decide what to release
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          HAS_CHANGESETS: ${{ steps.changesets.outputs.has-changesets }}
+        run: |
+          set -euo pipefail
+          NAME="$(node -p 'require("./package.json").name')"
+          VERSION="$(node -p 'require("./package.json").version')"
+          # Listing every version fails only on a real registry error, not
+          # on a missing version (npm view name@version exits 1 for that).
+          ON_NPM="$(npm view "$NAME" versions --json | V="$VERSION" node -p '[].concat(JSON.parse(require("fs").readFileSync(0, "utf8"))).includes(process.env.V) ? "yes" : ""')"
+          if [ "$EVENT" = workflow_dispatch ] && [ "$DRY_RUN" = true ]; then
+            MODE=dry-run
+          elif [ -n "$ON_NPM" ]; then
+            MODE=none
+          elif [ "$EVENT" = push ] && [ "$HAS_CHANGESETS" != false ]; then
+            MODE=none
+          else
+            MODE=publish
+          fi
+          echo "$NAME@$VERSION on npm: ${ON_NPM:-no}; mode: $MODE"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    if: ${{ needs.version.outputs.mode != 'none' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Verify the version
+        run: test "$(node -p 'require("./package.json").version')" = "$VERSION"
+
+      - name: Node setup
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24.x"
+
+      - name: Install and build
+        run: |
+          npm ci --ignore-scripts
+          npm run build:clean
+          npm run verify:package
+
+      - name: Gate on tests
+        run: |
+          npm run test
+          npm run typecheck
+          npm run lint
+          npm run format:check
+
+      - name: Pack
+        run: |
+          mkdir pack
+          npm pack --ignore-scripts --pack-destination pack
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-tarball
+          path: pack/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write # OIDC for npm trusted publishing
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      DRY_RUN: ${{ needs.version.outputs.mode == 'dry-run' }}
+    steps:
+      # No checkout and no install: this job runs only Node, npm and the
+      # tarball the build job tested. No registry-url on purpose: trusted
+      # publishing authenticates via OIDC, and setup-node's token-templated
+      # .npmrc would only add an empty-auth ambiguity.
+      - name: Node setup
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24.x"
+
+      # Trusted publishing needs npm >= 11.5.1.
+      - name: Update npm
+        run: npm install -g npm@^11.5.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package-tarball
+          path: pack
+
+      - name: Verify tarball version
+        run: |
+          set -euo pipefail
+          # The ./ prefix matters: npm reads "pack/x.tgz" as a GitHub
+          # shorthand, not a file.
+          test "$(find ./pack -name '*.tgz' | wc -l)" -eq 1
+          TARBALL="$(find ./pack -name '*.tgz')"
+          TARBALL_VERSION="$(tar -xzOf "$TARBALL" package/package.json | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).version')"
+          test "$TARBALL_VERSION" = "$VERSION"
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+
+      - name: Publish to npm
+        if: ${{ env.DRY_RUN != 'true' }}
+        run: npm publish --provenance --ignore-scripts "$TARBALL"
+
+      # --force only skips the "already published" check, so a dry run works
+      # on a released version. The OIDC exchange runs before the dry-run stop.
+      - name: Check trusted publishing (dry run)
+        if: ${{ env.DRY_RUN == 'true' }}
+        run: |
+          set -euo pipefail
+          npm publish --dry-run --force --provenance --ignore-scripts --loglevel verbose "$TARBALL" 2>&1 | tee publish.log
+          grep -q "Successfully retrieved and set token" publish.log
+
+  release:
+    needs: [version, publish]
+    if: ${{ needs.version.outputs.mode == 'publish' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      TAG: v${{ needs.version.outputs.version }}
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # The tag and the GitHub release come after npm has the version, so a
+      # failed publish leaves no tag to clean up. Rerunning skips a release
+      # that already exists.
+      - name: Tag and create the GitHub release
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "$TAG already released"
+            exit 0
+          fi
+          awk -v v="$VERSION" '$0 == "## " v {on = 1; next} /^## / {if (on) exit} on' CHANGELOG.md > notes.md
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md
